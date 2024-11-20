@@ -1,0 +1,31 @@
+# R-related files
+.Rhistory
+.RData
+.Rproj.user/
+.Rproj
+
+# Temporary files and caches
+*.html
+*.docx
+*.tex
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.spl
+
+# Markdown and other output files
+*.knit.md
+*.utf8.md
+
+# Folder for cached chunks
+_cache/
+*.RData
+
+# Folder for figures
+figure/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

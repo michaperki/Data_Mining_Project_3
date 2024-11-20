@@ -1,0 +1,303 @@
+---
+title: "Data Mining Project 3"
+author: "Olivia Hofmann, Michael Perkins"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+## Introduction
+
+The objective of this project is to classify counties into risk levels (**high**, **medium**, or **low**) for future pandemics using COVID-19 data. This report follows the CRISP-DM framework, focusing on **Data Preparation**, **Modeling**, **Evaluation**, and **Deployment**. The results can help stakeholders prepare for and mitigate the impact of future pandemics.
+
+---
+
+## 1. Data Preparation
+
+```{r load-libraries, cache=FALSE}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(rpart)  # Decision Tree
+library(randomForest)  # Random Forest
+library(e1071)  # SVM
+library(DMwR2)
+library(PRROC)
+library(ggplot2)
+library(gridExtra)
+```
+
+### Define Classes
+
+- The classes are based on confirmed COVID-19 cases per 10,000 population per week:
+  - **High Risk:** ≥ 50 cases.
+  - **Medium Risk:** 10–49 cases.
+  - **Low Risk:** < 10 cases.
+- These thresholds were chosen based on observed patterns in case severity and the need to trigger timely interventions.
+
+```{r load-data, cache=FALSE}
+# Load mobility data
+final_merged_dataset <- read_csv("data/final_merged_dataset.csv")
+```
+
+### Data Preparation Steps
+
+1. **Merge and Clean Data**: Ensure a single dataset with a class attribute.
+2. **Select Predictive Features**: Extract features with potential predictive power.
+3. **Handle Missing Data**: Use imputation or remove incomplete rows for models that cannot handle missing data.
+
+```{r process-data}
+# Define risk levels
+final_data <- final_merged_dataset %>%
+  mutate(risk_level = case_when(
+    count >= 50 ~ "high",
+    count >= 10 ~ "medium",
+    TRUE ~ "low"
+  )) %>%
+  mutate(risk_level = factor(risk_level, levels = c("low", "medium", "high")))
+
+# Select relevant features
+classification_data <- final_data %>%
+  select(retail_and_recreation_percent_change_from_baseline,
+         grocery_and_pharmacy_percent_change_from_baseline,
+         workplaces_percent_change_from_baseline,
+         PC1, PC2, week, risk_level) %>%
+  drop_na()
+
+# Split data into training and testing
+set.seed(123)
+training_index <- sample(1:nrow(classification_data), 0.7 * nrow(classification_data))
+training_data <- classification_data[training_index, ]
+testing_data <- classification_data[-training_index, ]
+
+# Balance training data
+min_class_size <- min(table(training_data$risk_level))
+balanced_training_data <- training_data %>%
+  group_by(risk_level) %>%
+  sample_n(min_class_size) %>%
+  ungroup()
+```
+
+---
+
+## 2. Modeling
+
+### Model 1: Decision Tree
+
+- **Advantages**: Simple and interpretable.
+
+```{r model-dt}
+dt_model <- rpart(risk_level ~ ., data = balanced_training_data, method = "class",
+                  control = rpart.control(cp = 0.05, maxdepth = 3))
+```
+
+### Model 2: Random Forest
+
+- **Advantages**: Handles large datasets and captures feature interactions.
+
+```{r model-rf}
+rf_model <- randomForest(risk_level ~ ., data = balanced_training_data, ntree = 100, mtry = 2)
+```
+
+### Model 3: Support Vector Machine (SVM)
+
+- **Advantages**: Effective for high-dimensional spaces.
+
+```{r model-svm}
+set.seed(123)
+subsample_index <- sample(1:nrow(balanced_training_data), 0.01 * nrow(balanced_training_data))
+subsample_data <- balanced_training_data[subsample_index, ]
+
+svm_model <- svm(risk_level ~ ., data = subsample_data, cost = 0.1, gamma = 0.01, kernel = 'linear')
+```
+
+---
+
+## 3. Evaluation
+
+### Confusion Matrices and Metrics
+
+```{r evaluation}
+# Decision Tree
+predictions_dt <- predict(dt_model, testing_data, type = "class")
+cat("Confusion Matrix for Decision Tree:\n")
+dt_conf <- confusionMatrix(predictions_dt, testing_data$risk_level)
+
+# Random Forest
+predictions_rf <- predict(rf_model, testing_data, type = "response")
+cat("Confusion Matrix for Random Forest:\n")
+rf_conf <- confusionMatrix(predictions_rf, testing_data$risk_level)
+
+# SVM
+predictions_svm <- predict(svm_model, testing_data)
+cat("Confusion Matrix for SVM:\n")
+confusionMatrix(predictions_svm, testing_data$risk_level)
+```
+
+### Model Performance Summary
+
+- **Decision Tree**:
+  - Accuracy: `0.6762`
+- **Random Forest**:
+  - Accuracy: `0.4338`
+- **SVM**:
+  - Accuracy: `0.7556`
+
+#### Model Performance Visualization
+
+## Model Performance Visualization
+
+---
+
+### 1. Confusion Matrix Heatmaps
+
+```{r confusion-matrix-heatmap, echo=FALSE}
+# Function to plot heatmap
+plot_confusion_matrix <- function(conf_matrix, title) {
+  data <- as.data.frame(conf_matrix$table)
+  ggplot(data, aes(Prediction, Reference, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white") +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal()
+}
+
+# Example for Decision Tree
+dt_conf <- confusionMatrix(predictions_dt, testing_data$risk_level)
+plot_confusion_matrix(dt_conf, "Decision Tree Confusion Matrix")
+```
+
+---
+
+### 2. ROC Curves
+
+```{r roc-curves, echo=FALSE}
+# One-vs-All ROC for each class
+roc_dt_high <- roc(as.numeric(testing_data$risk_level == "high"),
+                   as.numeric(predictions_dt == "high"))
+roc_rf_high <- roc(as.numeric(testing_data$risk_level == "high"),
+                   as.numeric(predictions_rf == "high"))
+
+roc_dt_medium <- roc(as.numeric(testing_data$risk_level == "medium"),
+                     as.numeric(predictions_dt == "medium"))
+roc_rf_medium <- roc(as.numeric(testing_data$risk_level == "medium"),
+                     as.numeric(predictions_rf == "medium"))
+
+# Plot ROC curves
+ggroc(list(
+  `Decision Tree (High)` = roc_dt_high,
+  `Random Forest (High)` = roc_rf_high,
+  `Decision Tree (Medium)` = roc_dt_medium,
+  `Random Forest (Medium)` = roc_rf_medium
+)) +
+  labs(title = "One-vs-All ROC Curves", x = "1 - Specificity", y = "Sensitivity") +
+  theme_minimal()
+```
+
+---
+
+### 3. Precision-Recall Curves
+
+```{r precision-recall, echo=FALSE}
+# Precision-Recall for each model
+pr_dt <- pr.curve(scores.class0 = as.numeric(predictions_dt == "high"),
+                  scores.class1 = as.numeric(testing_data$risk_level == "high"), curve = TRUE)
+pr_rf <- pr.curve(scores.class0 = as.numeric(predictions_rf == "high"),
+                  scores.class1 = as.numeric(testing_data$risk_level == "high"), curve = TRUE)
+
+# Plot PR Curves
+plot(pr_dt, main = "Precision-Recall Curve: Decision Tree")
+plot(pr_rf, main = "Precision-Recall Curve: Random Forest")
+```
+
+---
+
+### 4. Feature Importance for Random Forest
+
+```{r feature-importance, echo=FALSE}
+# Random Forest feature importance
+rf_importance <- as.data.frame(importance(rf_model))
+rf_importance$Feature <- rownames(rf_importance)
+ggplot(rf_importance, aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (Random Forest)", x = "Features", y = "Importance") +
+  theme_minimal()
+```
+
+---
+
+### 5. Bar Chart Comparison of Model Metrics
+
+```{r bar-chart-metrics, echo=FALSE}
+# Model metrics
+metrics <- data.frame(
+  Model = c("Decision Tree", "Random Forest"),
+  Accuracy = c(dt_conf$overall["Accuracy"], rf_conf$overall["Accuracy"]),
+  Kappa = c(dt_conf$overall["Kappa"], rf_conf$overall["Kappa"])
+)
+
+# Plot bar chart
+ggplot(metrics, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Accuracy Comparison", x = "Model", y = "Accuracy") +
+  theme_minimal()
+```
+
+---
+
+### 6. Misclassification Analysis
+
+```{r misclassification-analysis, echo=FALSE}
+# Misclassification by category
+misclassified <- testing_data %>%
+  mutate(
+    Predicted = predictions_rf,
+    Misclassified = ifelse(Predicted != risk_level, "Yes", "No")
+  )
+
+ggplot(misclassified, aes(x = risk_level, fill = Misclassified)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Misclassification Analysis by Risk Level", x = "Risk Level", y = "Count") +
+  theme_minimal()
+```
+
+---
+
+### Conclusion
+
+These visuals provide insights into the models' performance and help stakeholders understand the trade-offs between accuracy, precision, and recall for each classification method. They also highlight areas for improvement, such as addressing misclassifications.
+
+---
+
+## 4. Deployment
+
+- **Practical Use**: The model can guide early interventions (e.g., mask mandates, closures).
+- **Update Frequency**: Weekly updates based on new data.
+- **Integration**: Stakeholders can incorporate model predictions into decision-making frameworks.
+
+```{r deployment}
+# Save Random Forest model
+saveRDS(rf_model, file = "rf_model_balanced.rds")
+
+# Load the model
+loaded_model <- readRDS("rf_model_balanced.rds")
+```
+
+---
+
+## Appendix
+
+- **Team Contributions**:
+  - Olivia Hofmann: Lead on data preparation and feature engineering.
+  - Michael Perkins: Lead on modeling and evaluation.
+
+- **Graduate Work**:
+  - Additional models: Gradient Boosting and k-Nearest Neighbors (to be implemented).
