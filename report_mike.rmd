@@ -1,0 +1,961 @@
+---
+title: "Data Mining Project 3"
+author: "Olivia Hofmann and Michael Perkins"
+date: "December 9, 2024"
+output:
+  pdf_document:
+    fig_caption: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
+
+# Set graphics device to avoid Quartz issues on macOS
+options(device = "png")
+```
+
+\newpage
+
+# Introduction
+
+The COVID-19 pandemic highlighted the importance of preparedness for infectious disease outbreaks. Anticipating which counties are at higher risk can enable early interventions, potentially saving lives and mitigating economic impacts. This project aims to classify U.S. counties into **high**, **medium**, or **low** risk categories for future pandemics based on historical COVID-19 data and other socioeconomic factors.
+
+\newpage
+
+# Data Preparation
+
+```{r load-libraries, echo=FALSE, cache=FALSE, message=FALSE, warning=FALSE}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(rpart)  # Decision Tree
+library(randomForest)  # Random Forest
+library(e1071)  # SVM
+library(DMwR2)
+library(PRROC)
+library(ggplot2)
+library(gridExtra)
+library(pROC)
+library(xgboost)
+library(class)
+library(nnet)
+library(iml)
+library(knitr)
+library(scales)
+```
+
+## Define Classes
+
+```{r load-data, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Load mobility data
+final_merged_dataset <- read_csv("data/final_merged_dataset.csv")
+
+# Convert data from long to wide format
+final_merged_dataset <- final_merged_dataset %>%
+  pivot_wider(names_from = metric, values_from = count)
+
+```
+
+The classes for COVID-19 risk levels are defined based on confirmed cases per 10,000 population per week. The following thresholds aim to categorize the severity of the pandemic into actionable categories that inform public health responses and individual precautions. These thresholds align with public health standards observed in similar epidemiological studies and guidelines from health authorities such as the CDC or WHO.
+
+- **High Risk**: > 50 cases per 10,000 population per week
+
+> A high number of cases indicates widespread community transmission, which may overwhelm healthcare systems. This category is often used to trigger strict public health measures such as lockdowns, travel restrictions, or mass testing campaigns. The 50-case threshold for high risk captures a significant uptick in transmission, providing a signal for urgent measures.
+
+- **Medium Risk**: 10–49 cases per 10,000 population per week
+
+> A moderate number of cases suggests some level of community transmission. This may require targeted interventions such as localized restrictions or increased testing and vaccination efforts. The range for medium risk accommodates variability in case numbers while emphasizing the need for ongoing monitoring and targeted efforts.
+
+- **Low Risk**: < 10 cases per 10,000 population per week
+
+> A low number of cases implies limited transmission, often seen when preventive measures are effective, or when a region is in a recovery phase. The threshold for low risk aligns with goals for maintaining control and minimizing transmission.
+
+Examining the data helped confirm the appropriateness of these thresholds. For instance, regions with > 50 cases per 10,000 showed trends of healthcare strain and higher fatality rates and regions with < 10 cases were often associated with higher vaccination rates or stringent preventive measures.
+
+This classification is rooted in observed patterns and practical considerations, ensuring its relevance to real-world applications while maintaining simplicity for clear communication and policy alignment.
+
+## Data Preparation Steps
+
+To prepare for classification modeling, the dataset is merged, cleaned, and the data is processed to ensure that it is usable and relevant. A new column, risk_level, is created that categorizes the severity of COVID-19 cases into three levels: high, medium, and low. 
+
+These levels are defined based on the number of confirmed cases per 10,000 population per week:
+
+- **High Risk**: > 50 cases
+- **Medium Risk**: 10-49 cases
+- **Low Risk**: < 10 cases
+
+The risk_level column is converted to a factor, ensuring that it is treated as a categorical variable in the following modeling steps. This ensures that the dataset has a clear and actionable target variable (class attribute) for classification.
+
+Features were selected from the dataset that were likely to be predictive of the risk_level class. The selected features include:
+
+- Mobility-related changes (Retail Change, Grocery Change, and Workplace Change).
+- Principal Component Analysis (PCA) components (PC1 and PC2).
+- The week variable, indicating the temporal context of the data.
+
+These features are selected based on their potential to correlate with COVID-19 risk levels. PCA components are particularly useful as they reduce dimensionality while preserving variability in the data. 
+
+```{r process-data, echo=FALSE}
+# Define risk levels
+final_data <- final_merged_dataset %>%
+  mutate(risk_level = case_when(
+    confirmed_cases >= 50 ~ "high",
+    confirmed_cases >= 10 ~ "medium",
+    TRUE ~ "low"
+  )) %>%
+  mutate(risk_level = factor(risk_level, levels = c("low", "medium", "high")))
+
+# Select relevant features
+classification_data <- final_data %>%
+  select(retail_and_recreation_percent_change_from_baseline,
+         grocery_and_pharmacy_percent_change_from_baseline,
+         workplaces_percent_change_from_baseline,
+         PC1, PC2, week, risk_level) %>%
+  drop_na()
+
+# Split data into training and testing
+set.seed(123)
+training_index <- sample(1:nrow(classification_data), 0.7 * nrow(classification_data))
+training_data <- classification_data[training_index, ]
+testing_data <- classification_data[-training_index, ]
+
+# Balance training data
+min_class_size <- min(table(training_data$risk_level))
+balanced_training_data <- training_data %>%
+  group_by(risk_level) %>%
+  sample_n(min_class_size) %>%
+  ungroup()
+```
+
+A preview of the processed data is displayed in the table below. The data preparation steps ensure that the dataset is clean, balanced, and ready for classification modeling. 
+
+```{r data header, echo=FALSE}
+# Round the numeric columns and display the table
+classification_data %>%
+  mutate(
+    `PC1` = round(`PC1`, 2),
+    `PC2` = round(`PC2`, 2)
+  ) %>%
+  head(10) %>%
+  kable(
+    caption = "First 10 Rows of Classification Data",
+    col.names = c("Retail Change", "Grocery Change", "Workplace Change", 
+                  "PC1 Score", "PC2 Score", "Week", "Risk Level"),
+    align = c("c", "c", "c", "c", "c", "c", "c") # Center align columns
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+\newpage
+
+# Modeling
+```{r evaluation functions, echo = FALSE}
+# Enhanced function to calculate metrics and plot a bar chart
+calculate_metrics <- function(conf_matrix, title = "Metrics Bar Chart") {
+  # Calculate precision, recall, and F1-score
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)    # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall) # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Combine metrics into a list
+  metrics <- list(
+    Precision = precision,
+    Recall = recall,
+    F1 = f1
+  )
+  
+  # Create a data frame for plotting
+  metrics_df <- data.frame(
+    Class = colnames(conf_matrix),
+    Precision = precision,
+    Recall = recall,
+    F1 = f1
+  )
+  
+  # Reshape data for ggplot
+  metrics_long <- metrics_df %>%
+    pivot_longer(cols = c("Precision", "Recall", "F1"), names_to = "Metric", values_to = "Value")
+  
+  # Generate a bar chart
+  library(ggplot2)
+  plot <- ggplot(metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = title, x = "Class", y = "Score") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+  
+  # Print the plot
+  print(plot)
+}
+
+# Function to plot heatmap
+plot_confusion_matrix <- function(conf_matrix, title) {
+  # Convert the confusion matrix to a data frame
+  data <- as.data.frame(as.table(conf_matrix))
+  
+  # Create a heatmap using ggplot2
+  ggplot(data, aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 4) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal()
+}
+
+# Function to calculate One-vs-All ROC curves
+generate_roc_curves <- function(predictions, true_labels, model_name, classes) {
+  library(pROC)
+  
+  roc_curves <- list()
+  
+  # Generate ROC for each class
+  for (class in classes) {
+    roc_curves[[paste0(model_name, " (", class, ")")]] <- roc(
+      as.numeric(true_labels == class),
+      as.numeric(predictions == class)
+    )
+  }
+  
+  return(roc_curves)
+}
+
+# Function to compute and plot PR curves
+plot_pr_curve <- function(predictions, true_labels, model_name, class_label) {
+  # Calculate PR curve
+  pr <- pr.curve(
+    scores.class0 = as.numeric(predictions == class_label),  # Predicted positive scores
+    scores.class1 = as.numeric(true_labels == class_label),  # True positive labels
+    curve = TRUE
+  )
+  
+  # Plot the PR curve
+  plot(pr, main = paste("Precision-Recall Curve:", model_name, "-", class_label))
+  
+  # Return PR curve object for further use
+  return(pr)
+}
+
+# Function to compute misclassification for a model
+compute_misclassification <- function(predictions, true_labels, model_name) {
+  misclassified_data <- testing_data %>%
+    mutate(
+      Predicted = predictions,
+      Misclassified = ifelse(Predicted != true_labels, "Yes", "No")
+    ) %>%
+    mutate(Model = model_name)  # Add model name for grouping
+
+  return(misclassified_data)
+}
+
+# Function to save models.
+save_model <- function(model, file_name) {
+  saveRDS(model, file = file_name)
+  cat("Model saved to:", file_name, "\n")
+}
+
+# Function to load models.
+load_model <- function(file_name) {
+  model <- readRDS(file_name)
+  cat("Model loaded from:", file_name, "\n")
+  return(model)
+}
+
+# Improved heatmap function with conditional legend
+improved_heatmap <- function(conf_matrix, title, show_legend = TRUE) {
+  data <- as.data.frame(as.table(conf_matrix))
+  
+  ggplot(data, aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), color = "black", size = 3) +
+    scale_fill_gradient2(low = "lightblue", mid = "yellow", high = "red", midpoint = max(data$Freq) / 2) +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = ifelse(show_legend, "right", "none")
+    )
+}
+```
+
+## Model 1: Decision Tree
+
+```{r model-dt, echo=FALSE}
+set.seed(123)
+dt_model <- rpart(risk_level ~ ., data = balanced_training_data, method = "class",
+                  control = rpart.control(cp = 0.05, maxdepth = 3))
+```
+
+Decision trees use a tree-like structure to split data based on feature thresholds, aiming to classify samples into distinct classes. 
+
+**Advantages**:
+
+- Simple and Interpretable: Decision trees are easy to understand and visualize, making them highly interpretable for stakeholders.
+- Fast Training and Prediction: Decision trees train and predict quickly, especially for smaller datasets or datasets with few features.
+- Handles Mixed Data Types: Decision trees can work with both numerical and categorical data without requiring preprocessing or scaling.
+- Captures Nonlinear Relationships: Decision trees can model complex, nonlinear decision boundaries effectively.
+
+## Model 2: Random Forest
+
+```{r model-rf, echo=FALSE}
+set.seed(123)
+rf_model <- randomForest(risk_level ~ ., data = balanced_training_data, ntree = 100, mtry = 2)
+```
+
+Random forest is an ensemble method that trains multiple decision trees on random subsets of the data and aggregates their predictions for classification.
+
+**Advantages**:
+
+- Handles Large Datasets: Random forests can efficiently handle large datasets with high feature dimensionality.
+- Robustness: The ensemble approach reduces the risk of overfitting, providing more stable and generalized predictions.
+- Feature Importance: Random forests provide a measure of feature importance, helping to identify the most influential variables in the classification task.
+- Captures Feature Interactions: Random forests inherently model interactions between features due to the random splitting.
+
+## Model 3: Support Vector Machine (SVM)
+
+```{r model-svm, echo=FALSE}
+set.seed(123)
+subsample_index <- sample(1:nrow(balanced_training_data), 0.01 * nrow(balanced_training_data))
+subsample_data <- balanced_training_data[subsample_index, ]
+
+svm_model <- svm(risk_level ~ ., data = subsample_data, cost = 0.1, gamma = 0.01, kernel = 'linear')
+```
+
+Support vector machines constructs a hyperplane or set of hyperplanes in high-dimensional space to separate classes with the maximum margin.
+
+**Advantages**:
+
+- Effective for High-Dimensional Spaces: SVM works well when the number of features is large relative to the number of samples.
+- Robust to Overfitting: Especially effective for tasks with clear class separability in the feature space.
+- Flexibility with Kernels: The kernel trick enables SVM to model nonlinear relationships by transforming data into higher-dimensional spaces.
+- Handles Smaller Subsets: Using subsampling suits SVM well since it is computationally intensive on large datasets.
+
+## Model 4: Gradient Boosting
+
+```{r model-gb, echo=FALSE}
+# Prepare training features and labels
+x_train <- model.matrix(risk_level ~ . - 1, data = balanced_training_data)  # Remove intercept and non-numeric
+y_train <- as.numeric(balanced_training_data$risk_level) - 1  # Convert factor to 0-indexed numeric
+
+# Prepare testing features and labels
+x_test <- model.matrix(risk_level ~ . - 1, data = testing_data)
+y_test <- as.numeric(testing_data$risk_level) - 1
+
+# Train the Gradient Boosting model
+set.seed(123)
+xgb_model <- xgboost(
+  data = x_train,
+  label = y_train,
+  objective = "multi:softprob",  # Multiclass classification
+  num_class = length(unique(balanced_training_data$risk_level)),  # Number of classes
+  nrounds = 100,  # Number of boosting rounds
+  eta = 0.1,      # Learning rate
+  max_depth = 3,  # Tree depth
+  verbose = 0     # Suppress training logs
+)
+```
+
+Gradient boosting trains sequential decision trees, where each tree corrects the errors of the previous one by minimizing a specified loss function.
+
+**Advantages**:
+
+- Highly Accurate: Gradient boosting often achieves state-of-the-art performance for classification tasks.
+- Customizable: The learning rate, tree depth, and number of iterations can be tuned for optimal performance.
+- Handles Missing Data: Gradient boosting models handle missing values effectively.
+- Feature Importance: Similar to random forest, gradient boosting provides insights into feature importance.
+- Handles Multiclass Classification: The model can output class probabilities for each class, aiding in more nuanced decision-making.
+
+## Model 5: Logistic Regression
+
+```{r model-lr, echo=FALSE, results='hide'}
+# Train a multinomial logistic regression model
+logistic_model <- multinom(risk_level ~ ., data = balanced_training_data)
+```
+
+Logistic regression models the probability of class membership using a logistic function and assumes a linear relationship between features and the log-odds of the outcome.
+
+**Advantages**:
+
+- Simplicity: Logistic regression is easy to implement and computationally efficient, even for large datasets.
+- Interpretable Coefficients: The coefficients represent the strength and direction of the association between features and the outcome, providing clear interpretability.
+- Works Well for Linearly Separable Data: It performs best when classes are linearly separable in the feature space.
+- Baseline Model: Logistic regression serves as a reliable baseline to compare against more complex models.
+- Probabilistic Predictions: It provides probabilities for class membership, allowing for more informed decision-making thresholds.
+
+\newpage
+
+## Model Analysis
+
+### Confusion Matrices
+```{r confusion-matrices-all, echo=FALSE}
+library(tidyverse)
+
+# Helper function to convert confusion matrix into a data frame
+conf_matrix_to_df <- function(conf_matrix, model_name) {
+  df <- as.data.frame(conf_matrix)
+  
+  # Ensure consistent column names
+  colnames(df) <- c("Predicted", "Actual", "Count")
+  
+  # Add model name column
+  df <- df %>% mutate(Model = model_name)
+  
+  return(df)
+}
+
+# Generate confusion matrices
+predictions_dt <- predict(dt_model, testing_data, type = "class")
+dt_conf_matrix <- table(Predicted = predictions_dt, Actual = testing_data$risk_level)
+
+predictions_rf <- predict(rf_model, testing_data, type = "response")
+rf_conf_matrix <- table(Predicted = predictions_rf, Actual = testing_data$risk_level)
+
+predictions_svm <- predict(svm_model, testing_data)
+svm_conf_matrix <- table(Predicted = predictions_svm, Actual = testing_data$risk_level)
+
+xgb_predictions <- predict(xgb_model, x_test)
+xgb_probabilities <- matrix(xgb_predictions, ncol = length(levels(balanced_training_data$risk_level)), byrow = TRUE)
+colnames(xgb_probabilities) <- levels(balanced_training_data$risk_level)
+xgb_class <- apply(xgb_probabilities, 1, function(row) {
+  colnames(xgb_probabilities)[which.max(row)]
+})
+xgb_class <- factor(xgb_class, levels = levels(testing_data$risk_level))
+xgb_conf_matrix <- table(Predicted = xgb_class, Actual = testing_data$risk_level)
+
+logistic_predictions <- predict(logistic_model, newdata = testing_data)
+logistic_conf_matrix <- table(Predicted = logistic_predictions, Actual = testing_data$risk_level)
+
+# Combine all confusion matrices into one data frame
+conf_matrix_data <- bind_rows(
+  conf_matrix_to_df(dt_conf_matrix, "Decision Tree"),
+  conf_matrix_to_df(rf_conf_matrix, "Random Forest"),
+  conf_matrix_to_df(svm_conf_matrix, "SVM"),
+  conf_matrix_to_df(xgb_conf_matrix, "Gradient Boosting"),
+  conf_matrix_to_df(logistic_conf_matrix, "Logistic Regression")
+)
+
+# Create the heatmap
+library(ggplot2)
+confusion_matrix_plot <- ggplot(conf_matrix_data, aes(x = Predicted, y = Actual, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white", size = 3) +  # Add count labels
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Count") +
+  facet_wrap(~ Model, nrow = 2, ncol = 3) +
+  labs(
+    title = "Confusion Matrix Heatmaps by Model",
+    x = "Predicted Class",
+    y = "Actual Class"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",  # Place the legend on the right
+    panel.grid = element_blank(),  # Remove grid lines for cleaner heatmaps
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+    strip.text = element_text(size = 10, face = "bold")  # Bold facet titles
+  )
+
+# Print the plot
+confusion_matrix_plot
+
+```
+
+```{r confusion-matrix-table, echo=FALSE}
+# Function to extract metrics from a confusion matrix
+extract_metrics_per_class <- function(conf_matrix, levels) {
+  metrics_list <- list()
+  
+  # Loop through each class
+  for (class in levels) {
+    TP <- conf_matrix[class, class]  # True Positives for the class
+    FP <- sum(conf_matrix[, class]) - TP  # False Positives for the class
+    FN <- sum(conf_matrix[class, ]) - TP  # False Negatives for the class
+    TN <- sum(conf_matrix) - TP - FP - FN  # True Negatives for the class
+    
+    # Store the metrics in a list
+    metrics_list[[class]] <- list(TP = TP, TN = TN, FP = FP, FN = FN)
+  }
+    
+  return(metrics_list)
+}
+
+# Define levels (classes)
+levels <- levels(testing_data$risk_level)
+
+# Calculate metrics for each model
+dt_metrics <- extract_metrics_per_class(dt_conf_matrix, levels)
+rf_metrics <- extract_metrics_per_class(rf_conf_matrix, levels)
+svm_metrics <- extract_metrics_per_class(svm_conf_matrix, levels)
+xgb_metrics <- extract_metrics_per_class(xgb_conf_matrix, levels)
+lr_metrics <- extract_metrics_per_class(logistic_conf_matrix, levels)
+
+
+# Combine metrics into a single table
+# Combine metrics into a single table
+comparison_table <- data.frame(
+  Model = rep(c("Decision Tree", "Random Forest", "SVM", "Gradient Boosting", "Logistic Regression"), each = 3),
+  Class = rep(c("low", "medium", "high"), times = 5),
+  TP = c(
+    dt_metrics$low$TP, dt_metrics$medium$TP, dt_metrics$high$TP,
+    rf_metrics$low$TP, rf_metrics$medium$TP, rf_metrics$high$TP,
+    svm_metrics$low$TP, svm_metrics$medium$TP, svm_metrics$high$TP,
+    xgb_metrics$low$TP, xgb_metrics$medium$TP, xgb_metrics$high$TP,
+    lr_metrics$low$TP, lr_metrics$medium$TP, lr_metrics$high$TP
+  ),
+  TN = c(
+    dt_metrics$low$TN, dt_metrics$medium$TN, dt_metrics$high$TN,
+    rf_metrics$low$TN, rf_metrics$medium$TN, rf_metrics$high$TN,
+    svm_metrics$low$TN, svm_metrics$medium$TN, svm_metrics$high$TN,
+    xgb_metrics$low$TN, xgb_metrics$medium$TN, xgb_metrics$high$TN,
+    lr_metrics$low$TN, lr_metrics$medium$TN, lr_metrics$high$TN
+  ),
+  FP = c(
+    dt_metrics$low$FP, dt_metrics$medium$FP, dt_metrics$high$FP,
+    rf_metrics$low$FP, rf_metrics$medium$FP, rf_metrics$high$FP,
+    svm_metrics$low$FP, svm_metrics$medium$FP, svm_metrics$high$FP,
+    xgb_metrics$low$FP, xgb_metrics$medium$FP, xgb_metrics$high$FP,
+    lr_metrics$low$FP, lr_metrics$medium$FP, lr_metrics$high$FP
+  ),
+  FN = c(
+    dt_metrics$low$FN, dt_metrics$medium$FN, dt_metrics$high$FN,
+    rf_metrics$low$FN, rf_metrics$medium$FN, rf_metrics$high$FN,
+    svm_metrics$low$FN, svm_metrics$medium$FN, svm_metrics$high$FN,
+    xgb_metrics$low$FN, xgb_metrics$medium$FN, xgb_metrics$high$FN,
+    lr_metrics$low$FN, lr_metrics$medium$FN, lr_metrics$high$FN
+  )
+)
+
+# Format the numeric columns with commas for large numbers
+comparison_table <- comparison_table %>%
+  mutate(
+    TP = comma(TP),
+    TN = comma(TN),
+    FP = comma(FP),
+    FN = comma(FN)
+  )
+
+# Render the table with formatting and scrollable box
+comparison_table %>%
+  kable(
+    caption = "Confusion Matrix Metrics for Each Model",
+    col.names = c("Model", "Class", "True Positives", "True Negatives", "False Positives", "False Negatives"),
+    align = c("l", "c", "r", "r", "r", "r")
+  ) %>%
+  group_rows("Decision Tree", 1, 3) %>%
+  group_rows("Random Forest", 4, 6) %>%
+  group_rows("SVM", 7, 9) %>%
+  group_rows("Gradient Boosting", 10, 12) %>%
+  group_rows("Logistic Regression", 13, 15) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed"),
+    font_size = 8,  # Adjust font size
+    position = "center"
+  )
+
+```
+### Precision, Recall, and F1-Scores
+```{r precision-recall-f1-graphs, echo=FALSE}
+# Function to calculate precision, recall, and F1-score for a model
+calculate_metrics_table <- function(conf_matrix, model_name) {
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)     # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall)  # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Handle NaN values
+  precision[is.na(precision)] <- 0
+  recall[is.na(recall)] <- 0
+  f1[is.na(f1)] <- 0
+  
+  # Create data frame
+  data.frame(
+    Model = model_name,
+    Class = rownames(conf_matrix),
+    Metric = rep(c("Precision", "Recall", "F1"), each = length(rownames(conf_matrix))),
+    Score = c(precision, recall, f1)
+  )
+}
+
+# Calculate metrics for all models
+precision_recall_data <- bind_rows(
+  calculate_metrics_table(as.matrix(dt_conf_matrix), "Decision Tree"),
+  calculate_metrics_table(as.matrix(rf_conf_matrix), "Random Forest"),
+  calculate_metrics_table(as.matrix(svm_conf_matrix), "SVM"),
+  calculate_metrics_table(as.matrix(xgb_conf_matrix), "Gradient Boosting"),
+  calculate_metrics_table(as.matrix(logistic_conf_matrix), "Logistic Regression")
+)
+
+library(ggplot2)
+
+# Create the precision-recall plot
+precision_recall_plot <- ggplot(precision_recall_data, aes(x = Class, y = Score, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Model) +
+  labs(
+    title = "Precision, Recall, and F1-Score Metrics by Model and Class",
+    x = "Class",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",   # Legend on the right
+  )
+
+# Print the plot
+precision_recall_plot
+
+```
+
+```{r precision-recall-F1score-alt, echo=FALSE}
+library(knitr)
+library(kableExtra)
+
+# Define confusion matrices for all models
+conf_matrices <- list(
+  "Decision Tree" = dt_conf_matrix,
+  "Random Forest" = rf_conf_matrix,
+  "SVM" = svm_conf_matrix,
+  "Gradient Boosting" = xgb_conf_matrix,
+  "Logistic Regression" = logistic_conf_matrix
+)
+
+# Function to calculate precision, recall, and F1-score
+calculate_metrics_table <- function(conf_matrix, model_name) {
+  # Calculate precision, recall, and F1-score
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)     # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall)  # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Handle NaN values (caused by division by zero)
+  precision[is.na(precision)] <- 0
+  recall[is.na(recall)] <- 0
+  f1[is.na(f1)] <- 0
+  
+  metrics_df <- data.frame(
+    Model = model_name,
+    Class = rownames(conf_matrix),
+    Precision = round(precision, 2),
+    Recall = round(recall, 2),
+    F1_Score = round(f1, 2)
+  )
+  return(metrics_df)
+}
+
+# Collect metrics for each model
+metrics_list <- list()
+for (model_name in names(conf_matrices)) {
+  conf_matrix <- conf_matrices[[model_name]]
+  metrics_df <- calculate_metrics_table(conf_matrix, model_name)
+  metrics_list[[model_name]] <- metrics_df
+}
+
+# Combine metrics into a single table
+all_metrics <- do.call(rbind, metrics_list)
+
+# Create the grouped table
+# Display the metrics table without the first column
+all_metrics %>%
+  select(Model, Class, Precision, Recall, F1_Score) %>%  # Select only relevant columns
+  kable(
+    caption = "Precision, Recall, and F1-Score for Each Model",
+    col.names = c("Model", "Class", "Precision", "Recall", "F1 Score"),
+    row.names = FALSE  # Do not include row names
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  group_rows("Decision Tree", 1, 3) %>%
+  group_rows("Random Forest", 4, 6) %>%
+  group_rows("SVM", 7, 9) %>%
+  group_rows("Gradient Boosting", 10, 12) %>%
+  group_rows("Logistic Regression", 13, 15)
+```
+
+### Precision-Recall Curves
+
+
+### ROC Curves 
+
+```{r roc-curves, echo=FALSE, warning=FALSE, message=FALSE}
+classes <- c("low", "medium", "high")
+
+# Decision Tree
+roc_curves_dt <- generate_roc_curves(predictions_dt, testing_data$risk_level, "Decision Tree", classes)
+
+# Random Forest
+roc_curves_rf <- generate_roc_curves(predictions_rf, testing_data$risk_level, "Random Forest", classes)
+
+# SVM
+roc_curves_svm <- generate_roc_curves(predictions_svm, testing_data$risk_level, "SVM", classes)
+
+# Gradient Boosting (requires probabilities)
+xgb_class_prob <- predict(xgb_model, x_test) # Predict probabilities
+xgb_class_prob_matrix <- matrix(xgb_class_prob, ncol = length(unique(y_train)), byrow = TRUE) # Reshape into a matrix (rows = instances, columns = classes)
+colnames(xgb_class_prob_matrix) <- levels(balanced_training_data$risk_level) # Assign column names based on class levels
+roc_curves_xgb <- list(
+  "Gradient Boosting (low)" = roc(as.numeric(testing_data$risk_level == "low"), xgb_class_prob_matrix[, "low"]),
+  "Gradient Boosting (medium)" = roc(as.numeric(testing_data$risk_level == "medium"), xgb_class_prob_matrix[, "medium"]),
+  "Gradient Boosting (high)" = roc(as.numeric(testing_data$risk_level == "high"), xgb_class_prob_matrix[, "high"])
+)
+
+# Logistic Regression
+roc_curves_lr <- generate_roc_curves(logistic_predictions, testing_data$risk_level, "Logistic Regression", classes)
+
+# Combine Gradient Boosting ROC curves with others
+all_roc_curves <- c(roc_curves_dt, roc_curves_rf, roc_curves_svm, roc_curves_xgb, roc_curves_lr)
+
+# Combine all ROC curves into a single data frame for ggplot
+all_roc_curves_df <- bind_rows(
+  lapply(names(all_roc_curves), function(name) {
+    data.frame(
+      specificity = 1 - all_roc_curves[[name]]$specificities,
+      sensitivity = all_roc_curves[[name]]$sensitivities,
+      name = name
+    )
+  })
+)
+
+facet_labels <- c(low = "Low", medium = "Medium", high = "High")
+
+# Plot with facets for classes
+ggplot(all_roc_curves_df, aes(x = specificity, y = sensitivity, color = gsub(" \\(.*\\)", "", name), linetype = substr(name, regexpr("\\(", name) + 1, regexpr("\\)", name) - 1))) +
+  geom_line(size = 1) +
+  labs(title = "One-vs-All ROC Curves for All Models", x = "1 - Specificity", y = "Sensitivity", color = "Model", linetype = "Class") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.text = element_text(size = 8),
+    legend.key.width = unit(1, "cm")
+  ) +
+  guides(color = guide_legend(nrow = 2), linetype = guide_legend(nrow = 2)) +
+  facet_wrap(~ substr(name, regexpr("\\(", name) + 1, regexpr("\\)", name) - 1), 
+             scales = "fixed", 
+             labeller = as_labeller(facet_labels))
+
+
+
+```
+
+### Misclassification Analysis
+
+```{r misclassification-analysis, echo=FALSE}
+# Decision Tree
+misclassified_dt <- compute_misclassification(predictions_dt, testing_data$risk_level, "Decision Tree")
+
+# Random Forest
+misclassified_rf <- compute_misclassification(predictions_rf, testing_data$risk_level, "Random Forest")
+
+# SVM
+misclassified_svm <- compute_misclassification(predictions_svm, testing_data$risk_level, "SVM")
+
+# Gradient Boosting
+xgb_probabilities <- matrix(xgb_predictions, ncol = length(levels(testing_data$risk_level)), byrow = TRUE)
+xgb_class_predictions <- apply(xgb_probabilities, 1, function(row) {
+  levels(testing_data$risk_level)[which.max(row)]
+})
+misclassified_xgb <- compute_misclassification(
+  factor(xgb_class_predictions, levels = levels(testing_data$risk_level)),
+  testing_data$risk_level,
+  "Gradient Boosting"
+)
+
+# Logistic Regression
+misclassified_logistic <- compute_misclassification(logistic_predictions, testing_data$risk_level, "Logistic Regression")
+
+# Combine misclassification data
+misclassified_combined <- bind_rows(
+  misclassified_dt,
+  misclassified_rf,
+  misclassified_svm,
+  misclassified_xgb,
+  misclassified_logistic
+)
+
+# Visualize misclassifications
+ggplot(misclassified_combined, aes(x = risk_level, fill = Misclassified)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Model) +
+  labs(title = "Misclassification Analysis by Model and Risk Level",
+       x = "Risk Level",
+       y = "Count") +
+  theme_minimal()
+```
+
+## Feature Importance
+
+Understanding which features significantly influence the classification outcomes is vital for both model interpretability and actionable insights. In this section, we present a consolidated feature importance analysis for four models: **Decision Tree**, **Random Forest**, **SVM**, and **Gradient Boosting**.
+
+```{r feature-importance, echo=FALSE}
+
+# Extract feature importance from Decision Tree
+dt_importance <- as.data.frame(dt_model$variable.importance)
+dt_importance$Feature <- rownames(dt_importance)
+colnames(dt_importance) <- c("Importance", "Feature")
+dt_importance <- dt_importance %>%
+  mutate(Model = "Decision Tree")
+
+# Extract feature importance from Random Forest
+rf_importance <- as.data.frame(importance(rf_model))
+rf_importance$Feature <- rownames(rf_importance)
+rf_importance <- rf_importance %>%
+  rename(Importance = MeanDecreaseGini) %>%
+  mutate(Model = "Random Forest")
+
+# Extract coefficients from Linear SVM
+svm_coefficients <- t(svm_model$coefs) %*% svm_model$SV
+svm_coefficients_df <- as.data.frame(as.numeric(svm_coefficients))
+svm_coefficients_df$Feature <- colnames(balanced_training_data)[-ncol(balanced_training_data)]
+colnames(svm_coefficients_df) <- c("Coefficient", "Feature")
+svm_coefficients_df <- svm_coefficients_df %>%
+  mutate(Importance = abs(Coefficient)) %>%
+  mutate(Model = "SVM")
+
+# Extract feature importance from Gradient Boosting
+xgb_importance <- xgb.importance(model = xgb_model, feature_names = colnames(x_train))
+xgb_importance_df <- as.data.frame(xgb_importance)
+xgb_importance_df <- xgb_importance_df %>%
+  rename(Importance = Gain) %>%
+  mutate(Model = "Gradient Boosting")
+
+# Combine all feature importances excluding Logistic Regression
+all_importance <- bind_rows(
+  dt_importance,
+  rf_importance,
+  svm_coefficients_df %>% select(Feature, Importance, Model),
+  xgb_importance_df %>% select(Feature, Importance, Model)
+)
+
+# Replace underscores with spaces in Feature names for better readability
+all_importance$Feature <- gsub("_", " ", all_importance$Feature)
+
+# Standardize Importance scores within each Model (Min-Max Scaling)
+all_importance <- all_importance %>%
+  group_by(Model) %>%
+  mutate(Importance_Standardized = (Importance - min(Importance)) / (max(Importance) - min(Importance))) %>%
+  ungroup()
+
+# Select top 10 features per model based on standardized importance
+top_features <- all_importance %>%
+  group_by(Model) %>%
+  top_n(10, Importance_Standardized) %>%
+  ungroup()
+
+# Wrap long feature names for better visualization
+top_features$Feature <- str_wrap(top_features$Feature, width = 20)
+
+# Create the comparative feature importance plot with standardized scores
+ggplot(top_features, aes(x = Importance_Standardized, y = reorder(Feature, Importance_Standardized), fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Figure 1: Feature Importance Across Models",
+       x = "Standardized Importance",
+       y = "Features") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.text.y = element_text(size = 8)
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  scale_fill_brewer(palette = "Set1")
+
+```
+
+**Note:** Logistic Regression was excluded from the combined Feature Importance visualization because it primarily relies on the intercept and provides non-informative coefficients for features in this context. Including it alongside other models with meaningful feature importance metrics would distort the comparative analysis, leading to misleading interpretations.
+
+# Final Evaluation
+
+```{r final-evaluation, echo=FALSE, fig.align='left'}
+model_performance <- data.frame(
+  Model = c("Decision Tree", "Random Forest", "SVM", "Gradient Boosting", "Logistic Regression"),
+  Accuracy = c(
+    sum(diag(dt_conf_matrix)) / sum(dt_conf_matrix),
+    sum(diag(rf_conf_matrix)) / sum(rf_conf_matrix),
+    sum(diag(svm_conf_matrix)) / sum(svm_conf_matrix),
+    sum(diag(xgb_conf_matrix)) / sum(xgb_conf_matrix),
+    sum(diag(logistic_conf_matrix)) / sum(logistic_conf_matrix)
+  ),
+  Precision = c(
+    mean(diag(dt_conf_matrix) / colSums(dt_conf_matrix)),
+    mean(diag(rf_conf_matrix) / colSums(rf_conf_matrix)),
+    mean(diag(svm_conf_matrix) / colSums(svm_conf_matrix)),
+    mean(diag(xgb_conf_matrix) / colSums(xgb_conf_matrix)),
+    mean(diag(logistic_conf_matrix) / colSums(logistic_conf_matrix))
+  ),
+  Recall = c(
+    mean(diag(dt_conf_matrix) / rowSums(dt_conf_matrix)),
+    mean(diag(rf_conf_matrix) / rowSums(rf_conf_matrix)),
+    mean(diag(svm_conf_matrix) / rowSums(svm_conf_matrix)),
+    mean(diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix)),
+    mean(diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix))
+  ),
+  F1_Score = c(
+    mean(2 * (diag(dt_conf_matrix) / colSums(dt_conf_matrix)) * (diag(dt_conf_matrix) / rowSums(dt_conf_matrix)) / 
+          (diag(dt_conf_matrix) / colSums(dt_conf_matrix) + diag(dt_conf_matrix) / rowSums(dt_conf_matrix))),
+    mean(2 * (diag(rf_conf_matrix) / colSums(rf_conf_matrix)) * (diag(rf_conf_matrix) / rowSums(rf_conf_matrix)) / 
+          (diag(rf_conf_matrix) / colSums(rf_conf_matrix) + diag(rf_conf_matrix) / rowSums(rf_conf_matrix))),
+    mean(2 * (diag(svm_conf_matrix) / colSums(svm_conf_matrix)) * (diag(svm_conf_matrix) / rowSums(svm_conf_matrix)) / 
+          (diag(svm_conf_matrix) / colSums(svm_conf_matrix) + diag(svm_conf_matrix) / rowSums(svm_conf_matrix))),
+    mean(2 * (diag(xgb_conf_matrix) / colSums(xgb_conf_matrix)) * (diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix)) / 
+          (diag(xgb_conf_matrix) / colSums(xgb_conf_matrix) + diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix))),
+    mean(2 * (diag(logistic_conf_matrix) / colSums(logistic_conf_matrix)) * (diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix)) / 
+          (diag(logistic_conf_matrix) / colSums(logistic_conf_matrix) + diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix)))
+  )
+)
+
+# Display the summary table
+library(kableExtra)
+
+model_performance %>%
+  kable(
+    caption = "Comparative Model Performance Metrics",
+    digits = 2,
+    col.names = c("Model", "Accuracy", "Precision", "Recall", "F1-Score")
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+
+## Conclusion
+
+These visuals provide insights into the models' performance and help stakeholders understand the trade-offs between accuracy, precision, and recall for each classification method. They also highlight areas for improvement, such as addressing classifications.
+
+
+# Deployment
+
+- **Practical Use**: The model can guide early interventions (e.g., mask mandates, closures).
+- **Update Frequency**: Weekly updates based on new data.
+- **Integration**: Stakeholders can incorporate model predictions into decision-making frameworks.
+
+```{r deployment, echo=FALSE, results = 'hide', message=FALSE}
+# Save all models
+# save_model(dt_model, "dt_model_balanced.rds")
+# save_model(rf_model, "rf_model_balanced.rds")
+# save_model(svm_model, "svm_model_balanced.rds")
+# save_model(xgb_model, "xgb_model_balanced.rds")
+# save_model(logistic_model, "logistic_model_balanced.rds")
+
+# Load all models
+# loaded_dt_model <- load_model("dt_model_balanced.rds")
+# loaded_rf_model <- load_model("rf_model_balanced.rds")
+# loaded_svm_model <- load_model("svm_model_balanced.rds")
+# loaded_xgb_model <- load_model("xgb_model_balanced.rds")
+# loaded_logistic_model <- load_model("logistic_model_balanced.rds")
+```
+
+# Appendix
+
+## Team Contributions
+
+- Olivia Hofmann: Lead on data preparation and feature engineering.
+- Michael Perkins: Lead on modeling and evaluation.
+
+## Graduate Work
+
+- Additional models: Gradient Boosting and Logistic Regression.
