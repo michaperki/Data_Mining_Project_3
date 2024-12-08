@@ -1,0 +1,1113 @@
+---
+title: "Data Mining Project 3"
+author: "Olivia Hofmann and Michael Perkins"
+date: "December 9, 2024"
+output:
+  pdf_document:
+    fig_caption: true
+    toc: true
+    toc_depth: 3
+header-includes: 
+  - \usepackage{caption}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
+
+# Set graphics device to avoid Quartz issues on macOS
+options(device = "png")
+```
+
+\newpage
+
+# Data Preparation
+
+```{r load-libraries, echo=FALSE, cache=FALSE, message=FALSE, warning=FALSE}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(rpart)  # Decision Tree
+library(randomForest)  # Random Forest
+library(e1071)  # SVM
+library(DMwR2)
+library(PRROC)
+library(ggplot2)
+library(gridExtra)
+library(pROC)
+library(xgboost)
+library(class)
+library(nnet)
+library(iml)
+library(knitr)
+library(scales)
+library(kableExtra)
+```
+
+## Define Classes
+
+The COVID-19 pandemic highlighted the importance of preparedness for infectious disease outbreaks. Anticipating which counties are at higher risk can enable early interventions, potentially saving lives and mitigating economic impacts. This project aims to classify U.S. counties into **high**, **medium**, or **low** risk categories for future pandemics based on historical COVID-19 data and other socioeconomic factors.
+
+```{r load-data, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Load mobility data
+final_merged_dataset <- read_csv("data/final_merged_dataset.csv")
+
+# Convert data from long to wide format
+final_merged_dataset <- final_merged_dataset %>%
+  pivot_wider(names_from = metric, values_from = count)
+
+```
+
+The classes for COVID-19 risk levels are defined based on confirmed cases per 10,000 population per week. The following thresholds aim to categorize the severity of the pandemic into actionable categories that inform public health responses and individual precautions.
+
+- **High Risk**: > 50 cases per 10,000 population per week
+
+> A high number of cases indicates widespread community transmission, which may overwhelm healthcare systems. This category is often used to trigger strict public health measures such as lockdowns, travel restrictions, or mass testing campaigns. The 50-case threshold for high risk captures a significant uptick in transmission, providing a signal for urgent measures.
+
+- **Medium Risk**: 10–49 cases per 10,000 population per week
+
+> A moderate number of cases suggests some level of community transmission. This may require targeted interventions such as localized restrictions or increased testing and vaccination efforts. The range for medium risk accommodates variability in case numbers while emphasizing the need for ongoing monitoring and targeted efforts.
+
+- **Low Risk**: < 10 cases per 10,000 population per week
+
+> A low number of cases implies limited transmission, often seen when preventive measures are effective, or when a region is in a recovery phase. The threshold for low risk aligns with goals for maintaining control and minimizing transmission.
+
+Examining the data helped confirm the appropriateness of these thresholds. For instance, regions with > 50 cases per 10,000 showed trends of healthcare strain and higher fatality rates while regions with < 10 cases were often associated with higher vaccination rates or stringent preventive measures. This classification is rooted in observed patterns and practical considerations, ensuring its relevance to real-world applications while maintaining simplicity for clear communication and policy alignment.
+
+## Data Preparation Steps
+
+To prepare for classification modeling, the dataset is merged, cleaned, and the data is processed to ensure that it is usable and relevant. A new column, risk_level, is created that categorizes the severity of COVID-19 cases into three levels: high, medium, and low. 
+
+These levels are defined based on the number of confirmed cases per 10,000 population per week:
+
+- **High Risk**: > 50 cases
+- **Medium Risk**: 10-49 cases
+- **Low Risk**: < 10 cases
+
+The risk_level column is converted to a factor, etreating it as a categorical variable in the following modeling steps. This ensures that the dataset has a clear and actionable target variable (class attribute) for classification.
+
+Features were selected from the dataset that were likely to be predictive of the risk_level class. The selected features include:
+
+- Mobility-related changes (**Retail Change**, **Grocery Change**, and **Workplace Change)**.
+- Principal Component Analysis (PCA) components (**PC1** and **PC2**).
+- The week variable, indicating the temporal context of the data.
+
+These features are selected based on their potential to correlate with COVID-19 risk levels. PCA components are particularly useful as they reduce dimensionality while preserving variability in the data. 
+
+```{r process-data, echo=FALSE}
+# Define risk levels
+final_data <- final_merged_dataset %>%
+  mutate(risk_level = case_when(
+    confirmed_cases >= 50 ~ "high",
+    confirmed_cases >= 10 ~ "medium",
+    TRUE ~ "low"
+  )) %>%
+  mutate(risk_level = factor(risk_level, levels = c("low", "medium", "high")))
+
+# Select relevant features
+classification_data <- final_data %>%
+  select(retail_and_recreation_percent_change_from_baseline,
+         grocery_and_pharmacy_percent_change_from_baseline,
+         workplaces_percent_change_from_baseline,
+         PC1, PC2, week, risk_level) %>%
+  drop_na()
+
+# Split data into training and testing
+set.seed(123)
+training_index <- sample(1:nrow(classification_data), 0.7 * nrow(classification_data))
+training_data <- classification_data[training_index, ]
+testing_data <- classification_data[-training_index, ]
+
+# Balance training data
+min_class_size <- min(table(training_data$risk_level))
+balanced_training_data <- training_data %>%
+  group_by(risk_level) %>%
+  sample_n(min_class_size) %>%
+  ungroup()
+```
+
+A preview of the processed data is displayed in Table 1 below. The data preparation steps ensure that the dataset is clean, balanced, and ready for classification modeling. 
+
+```{r data header, echo=FALSE}
+# Round the numeric columns and display the table
+classification_data %>%
+  mutate(
+    `PC1` = round(`PC1`, 2),
+    `PC2` = round(`PC2`, 2)
+  ) %>%
+  head(10) %>%
+  kable(
+    caption = "First 10 Rows of Classification Data",
+    col.names = c("Retail Change", "Grocery Change", "Workplace Change", 
+                  "PC1 Score", "PC2 Score", "Week", "Risk Level"),
+    align = c("c", "c", "c", "c", "c", "c", "c") # Center align columns
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+\newpage
+
+# Modeling
+```{r evaluation functions, echo = FALSE}
+# Enhanced function to calculate metrics and plot a bar chart
+calculate_metrics <- function(conf_matrix, title = "Metrics Bar Chart") {
+  # Calculate precision, recall, and F1-score
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)    # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall) # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Combine metrics into a list
+  metrics <- list(
+    Precision = precision,
+    Recall = recall,
+    F1 = f1
+  )
+  
+  # Create a data frame for plotting
+  metrics_df <- data.frame(
+    Class = colnames(conf_matrix),
+    Precision = precision,
+    Recall = recall,
+    F1 = f1
+  )
+  
+  # Reshape data for ggplot
+  metrics_long <- metrics_df %>%
+    pivot_longer(cols = c("Precision", "Recall", "F1"), names_to = "Metric", values_to = "Value")
+  
+  # Generate a bar chart
+  library(ggplot2)
+  plot <- ggplot(metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = title, x = "Class", y = "Score") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2")
+  
+  # Print the plot
+  print(plot)
+}
+
+# Function to plot heatmap
+plot_confusion_matrix <- function(conf_matrix, title) {
+  # Convert the confusion matrix to a data frame
+  data <- as.data.frame(as.table(conf_matrix))
+  
+  # Create a heatmap using ggplot2
+  ggplot(data, aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 4) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal()
+}
+
+# Function to calculate One-vs-All ROC curves
+generate_roc_curves <- function(predictions, true_labels, model_name, classes) {
+  library(pROC)
+  
+  roc_curves <- list()
+  
+  # Generate ROC for each class
+  for (class in classes) {
+    roc_curves[[paste0(model_name, " (", class, ")")]] <- roc(
+      as.numeric(true_labels == class),
+      as.numeric(predictions == class)
+    )
+  }
+  
+  return(roc_curves)
+}
+
+# Function to compute and plot PR curves
+plot_pr_curve <- function(predictions, true_labels, model_name, class_label) {
+  # Calculate PR curve
+  pr <- pr.curve(
+    scores.class0 = as.numeric(predictions == class_label),  # Predicted positive scores
+    scores.class1 = as.numeric(true_labels == class_label),  # True positive labels
+    curve = TRUE
+  )
+  
+  # Plot the PR curve
+  plot(pr, main = paste("Precision-Recall Curve:", model_name, "-", class_label))
+  
+  # Return PR curve object for further use
+  return(pr)
+}
+
+# Function to compute misclassification for a model
+compute_misclassification <- function(predictions, true_labels, model_name) {
+  misclassified_data <- testing_data %>%
+    mutate(
+      Predicted = predictions,
+      Misclassified = ifelse(Predicted != true_labels, "Yes", "No")
+    ) %>%
+    mutate(Model = model_name)  # Add model name for grouping
+
+  return(misclassified_data)
+}
+
+# Function to save models.
+save_model <- function(model, file_name) {
+  saveRDS(model, file = file_name)
+  cat("Model saved to:", file_name, "\n")
+}
+
+# Function to load models.
+load_model <- function(file_name) {
+  model <- readRDS(file_name)
+  cat("Model loaded from:", file_name, "\n")
+  return(model)
+}
+
+# Improved heatmap function with conditional legend
+improved_heatmap <- function(conf_matrix, title, show_legend = TRUE) {
+  data <- as.data.frame(as.table(conf_matrix))
+  
+  ggplot(data, aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), color = "black", size = 3) +
+    scale_fill_gradient2(low = "lightblue", mid = "yellow", high = "red", midpoint = max(data$Freq) / 2) +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = ifelse(show_legend, "right", "none")
+    )
+}
+```
+
+## Model 1: Decision Tree
+
+```{r model-dt, echo=FALSE}
+set.seed(123)
+dt_model <- rpart(risk_level ~ ., data = balanced_training_data, method = "class",
+                  control = rpart.control(cp = 0.05, maxdepth = 3))
+```
+
+**Decision trees** use a tree-like structure to split data based on feature thresholds, aiming to classify samples into distinct classes. 
+
+**Advantages**:
+
+- **Simple and Interpretable**: **Decision trees** are easy to understand and visualize, making them highly interpretable for stakeholders.
+- **Fast Training and Prediction**: **Decision trees** train and predict quickly, especially for smaller datasets or datasets with few features.
+- **Handles Mixed Data Types**: **Decision trees** can work with both numerical and categorical data without requiring preprocessing or scaling.
+- **Captures Nonlinear Relationship**s: **Decision trees** can model complex, nonlinear decision boundaries effectively.
+
+## Model 2: Random Forest
+
+```{r model-rf, echo=FALSE}
+set.seed(123)
+rf_model <- randomForest(risk_level ~ ., data = balanced_training_data, ntree = 100, mtry = 2)
+```
+
+**Random forest** is an ensemble method that trains multiple decision trees on random subsets of the data and aggregates their predictions for classification.
+
+**Advantages**:
+
+- **Handles Large Datasets**: **Random forests** can efficiently handle large datasets with high feature dimensionality.
+- **Robustness**: The ensemble approach reduces the risk of overfitting, providing more stable and generalized predictions.
+- **Feature Importance**: **Random forests** provide a measure of feature importance, helping to identify the most influential variables in the classification task.
+- **Captures Feature Interactions**: **Random forests** inherently model interactions between features due to the random splitting.
+
+## Model 3: Support Vector Machine (SVM)
+
+```{r model-svm, echo=FALSE}
+set.seed(123)
+subsample_index <- sample(1:nrow(balanced_training_data), 0.01 * nrow(balanced_training_data))
+subsample_data <- balanced_training_data[subsample_index, ]
+
+svm_model <- svm(risk_level ~ ., data = subsample_data, cost = 0.1, gamma = 0.01, kernel = 'linear')
+```
+
+**Support vector machines** constructs a hyperplane or set of hyperplanes in high-dimensional space to separate classes with the maximum margin.
+
+**Advantages**:
+
+- **Effective for High-Dimensional Spaces**: **SVM** works well when the number of features is large relative to the number of samples.
+- **Robust to Overfitting**: Especially effective for tasks with clear class separability in the feature space.
+- **Flexibility with Kernels**: The kernel trick enables **SVM** to model nonlinear relationships by transforming data into higher-dimensional spaces.
+- **Handles Smaller Subsets**: Using subsampling suits **SVM** well since it is computationally intensive on large datasets.
+
+## Model 4: Gradient Boosting
+
+```{r model-gb, echo=FALSE}
+# Prepare training features and labels
+x_train <- model.matrix(risk_level ~ . - 1, data = balanced_training_data)  # Remove intercept and non-numeric
+y_train <- as.numeric(balanced_training_data$risk_level) - 1  # Convert factor to 0-indexed numeric
+
+# Prepare testing features and labels
+x_test <- model.matrix(risk_level ~ . - 1, data = testing_data)
+y_test <- as.numeric(testing_data$risk_level) - 1
+
+# Train the Gradient Boosting model
+set.seed(123)
+xgb_model <- xgboost(
+  data = x_train,
+  label = y_train,
+  objective = "multi:softprob",  # Multiclass classification
+  num_class = length(unique(balanced_training_data$risk_level)),  # Number of classes
+  nrounds = 100,  # Number of boosting rounds
+  eta = 0.1,      # Learning rate
+  max_depth = 3,  # Tree depth
+  verbose = 0     # Suppress training logs
+)
+```
+
+**Gradient boosting** trains sequential decision trees, where each tree corrects the errors of the previous one by minimizing a specified loss function.
+
+**Advantages**:
+
+- **Highly Accurate**: **Gradient boosting** often achieves state-of-the-art performance for classification tasks.
+- **Customizable**: The learning rate, tree depth, and number of iterations can be tuned for optimal performance.
+- **Handles Missing Data**: **Gradient boosting** models handle missing values effectively.
+- **Feature Importance**: Similar to random forest, **gradient boosting** provides insights into feature importance.
+- **Handles Multiclass Classification**: The model can output class probabilities for each class, aiding in more nuanced decision-making.
+
+## Model 5: Logistic Regression
+
+```{r model-lr, echo=FALSE, results='hide'}
+# Train a multinomial logistic regression model
+logistic_model <- multinom(risk_level ~ ., data = balanced_training_data)
+```
+
+**Logistic regression** models the probability of class membership using a logistic function and assumes a linear relationship between features and the log-odds of the outcome.
+
+**Advantages**:
+
+- **Simplicity**: **Logistic regression** is easy to implement and computationally efficient, even for large datasets.
+- **Interpretable Coefficients**: The coefficients represent the strength and direction of the association between features and the outcome, providing clear interpretability.
+- **Works Well for Linearly Separable Data**: It performs best when classes are linearly separable in the feature space.
+- **Baseline Model**: **Logistic regression** serves as a reliable baseline to compare against more complex models.
+- **Probabilistic Predictions**: It provides probabilities for class membership, allowing for more informed decision-making thresholds.
+
+\newpage
+
+## Model Analysis
+
+### Confusion Matrices
+**Confusion matrix** heatmaps visually represent the classification performance of each model across the three classes: **low**, **medium**, and **high**. Each heatmap, shown in Figure 1, displays the counts of true positives, false positives, and false negatives. The color intensity indicates the magnitude of the counts, with darker colors representing higher values.
+
+\vspace{10pt}
+
+```{r confusion-matrices-all, echo=FALSE}
+library(tidyverse)
+
+# Helper function to convert confusion matrix into a data frame
+conf_matrix_to_df <- function(conf_matrix, model_name) {
+  df <- as.data.frame(conf_matrix)
+  
+  # Ensure consistent column names
+  colnames(df) <- c("Predicted", "Actual", "Count")
+  
+  # Add model name column
+  df <- df %>% mutate(Model = model_name)
+  
+  return(df)
+}
+
+# Generate confusion matrices
+predictions_dt <- predict(dt_model, testing_data, type = "class")
+dt_conf_matrix <- table(Predicted = predictions_dt, Actual = testing_data$risk_level)
+
+predictions_rf <- predict(rf_model, testing_data, type = "response")
+rf_conf_matrix <- table(Predicted = predictions_rf, Actual = testing_data$risk_level)
+
+predictions_svm <- predict(svm_model, testing_data)
+svm_conf_matrix <- table(Predicted = predictions_svm, Actual = testing_data$risk_level)
+
+xgb_predictions <- predict(xgb_model, x_test)
+xgb_probabilities <- matrix(xgb_predictions, ncol = length(levels(balanced_training_data$risk_level)), byrow = TRUE)
+colnames(xgb_probabilities) <- levels(balanced_training_data$risk_level)
+xgb_class <- apply(xgb_probabilities, 1, function(row) {
+  colnames(xgb_probabilities)[which.max(row)]
+})
+xgb_class <- factor(xgb_class, levels = levels(testing_data$risk_level))
+xgb_conf_matrix <- table(Predicted = xgb_class, Actual = testing_data$risk_level)
+
+logistic_predictions <- predict(logistic_model, newdata = testing_data)
+logistic_conf_matrix <- table(Predicted = logistic_predictions, Actual = testing_data$risk_level)
+
+# Combine all confusion matrices into one data frame
+conf_matrix_data <- bind_rows(
+  conf_matrix_to_df(dt_conf_matrix, "Decision Tree"),
+  conf_matrix_to_df(rf_conf_matrix, "Random Forest"),
+  conf_matrix_to_df(svm_conf_matrix, "SVM"),
+  conf_matrix_to_df(xgb_conf_matrix, "Gradient Boosting"),
+  conf_matrix_to_df(logistic_conf_matrix, "Logistic Regression")
+)
+
+# Create the heatmap
+library(ggplot2)
+confusion_matrix_plot <- ggplot(conf_matrix_data, aes(x = Predicted, y = Actual, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white", size = 3) +  # Add count labels
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Count") +
+  facet_wrap(~ Model, nrow = 2, ncol = 3) +
+  labs(
+    title = "Confusion Matrix Heatmaps by Model",
+    x = "Predicted Class",
+    y = "Actual Class"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",  # Place the legend on the right
+    panel.grid = element_blank(),  # Remove grid lines for cleaner heatmaps
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+    strip.text = element_text(size = 10, face = "bold")  # Bold facet titles
+  )
+
+# Print the plot
+confusion_matrix_plot
+
+```
+
+\captionof{figure}{Confusion Matrix Heatmaps by Model}
+
+\vspace{10pt}
+
+- **Decision Tree**: Performs well for the **high** class with many correct predictions, but struggles with misclassifications for **medium** and **low** classes. The model misclassifies a large number of **low** instances as **high**.
+- **Random Forest**: Significantly improves accuracy across all classes. The model excels in **high** and **low** class predictions, with minimal false negatives and false positives compared to other models.
+- **SVM**: Effective in classifying the **low** class, but struggles with **medium** and **high** classes. The model has a substantial number of misclassifications occur for **medium**, indicating difficulty in separating this class in the feature space.
+- **Gradient Boosting**: Handles **high** and **low** classes with high precision and recall, as evident by the strong diagonal counts in the heatmap. This model struggles with **medium**, likely due to overlapping characteristics in the feature space.
+- **Logistic Regression**: Performs well for **low** and **high**. The high false positives and false negatives for **medium** suggest a linear decision boundary may not fully capture the complexity of the data.
+
+\vspace{8pt}
+
+The **confusion matrices** metrics table, Table 2, provides detailed numerical insights into the performance of each model across the three classes. It includes:
+
+- **True Positives**: Correctly predicted instances of a class.
+- **True Negatives**: Instances correctly classified as not belonging to the class.
+- **False Positives**: Instances incorrectly predicted as belonging to the class.
+- **False Negatives**: Instances of the class incorrectly classified as another class.
+
+```{r confusion-matrix-table, echo=FALSE}
+# Function to extract metrics from a confusion matrix
+extract_metrics_per_class <- function(conf_matrix, levels) {
+  metrics_list <- list()
+  
+  # Loop through each class
+  for (class in levels) {
+    TP <- conf_matrix[class, class]  # True Positives for the class
+    FP <- sum(conf_matrix[, class]) - TP  # False Positives for the class
+    FN <- sum(conf_matrix[class, ]) - TP  # False Negatives for the class
+    TN <- sum(conf_matrix) - TP - FP - FN  # True Negatives for the class
+    
+    # Store the metrics in a list
+    metrics_list[[class]] <- list(TP = TP, TN = TN, FP = FP, FN = FN)
+  }
+    
+  return(metrics_list)
+}
+
+# Define levels (classes)
+levels <- levels(testing_data$risk_level)
+
+# Calculate metrics for each model
+dt_metrics <- extract_metrics_per_class(dt_conf_matrix, levels)
+rf_metrics <- extract_metrics_per_class(rf_conf_matrix, levels)
+svm_metrics <- extract_metrics_per_class(svm_conf_matrix, levels)
+xgb_metrics <- extract_metrics_per_class(xgb_conf_matrix, levels)
+lr_metrics <- extract_metrics_per_class(logistic_conf_matrix, levels)
+
+
+# Combine metrics into a single table
+# Combine metrics into a single table
+comparison_table <- data.frame(
+  Model = rep(c("Decision Tree", "Random Forest", "SVM", "Gradient Boosting", "Logistic Regression"), each = 3),
+  Class = rep(c("low", "medium", "high"), times = 5),
+  TP = c(
+    dt_metrics$low$TP, dt_metrics$medium$TP, dt_metrics$high$TP,
+    rf_metrics$low$TP, rf_metrics$medium$TP, rf_metrics$high$TP,
+    svm_metrics$low$TP, svm_metrics$medium$TP, svm_metrics$high$TP,
+    xgb_metrics$low$TP, xgb_metrics$medium$TP, xgb_metrics$high$TP,
+    lr_metrics$low$TP, lr_metrics$medium$TP, lr_metrics$high$TP
+  ),
+  TN = c(
+    dt_metrics$low$TN, dt_metrics$medium$TN, dt_metrics$high$TN,
+    rf_metrics$low$TN, rf_metrics$medium$TN, rf_metrics$high$TN,
+    svm_metrics$low$TN, svm_metrics$medium$TN, svm_metrics$high$TN,
+    xgb_metrics$low$TN, xgb_metrics$medium$TN, xgb_metrics$high$TN,
+    lr_metrics$low$TN, lr_metrics$medium$TN, lr_metrics$high$TN
+  ),
+  FP = c(
+    dt_metrics$low$FP, dt_metrics$medium$FP, dt_metrics$high$FP,
+    rf_metrics$low$FP, rf_metrics$medium$FP, rf_metrics$high$FP,
+    svm_metrics$low$FP, svm_metrics$medium$FP, svm_metrics$high$FP,
+    xgb_metrics$low$FP, xgb_metrics$medium$FP, xgb_metrics$high$FP,
+    lr_metrics$low$FP, lr_metrics$medium$FP, lr_metrics$high$FP
+  ),
+  FN = c(
+    dt_metrics$low$FN, dt_metrics$medium$FN, dt_metrics$high$FN,
+    rf_metrics$low$FN, rf_metrics$medium$FN, rf_metrics$high$FN,
+    svm_metrics$low$FN, svm_metrics$medium$FN, svm_metrics$high$FN,
+    xgb_metrics$low$FN, xgb_metrics$medium$FN, xgb_metrics$high$FN,
+    lr_metrics$low$FN, lr_metrics$medium$FN, lr_metrics$high$FN
+  )
+)
+
+# Format the numeric columns with commas for large numbers
+comparison_table <- comparison_table %>%
+  mutate(
+    TP = comma(TP),
+    TN = comma(TN),
+    FP = comma(FP),
+    FN = comma(FN)
+  )
+
+# Render the table with formatting and scrollable box
+comparison_table %>%
+  kable(
+    caption = "Confusion Matrix Metrics for Each Model",
+    col.names = c("Model", "Class", "True Positives", "True Negatives", "False Positives", "False Negatives"),
+    align = c("l", "c", "r", "r", "r", "r")
+  ) %>%
+  group_rows("Decision Tree", 1, 3) %>%
+  group_rows("Random Forest", 4, 6) %>%
+  group_rows("SVM", 7, 9) %>%
+  group_rows("Gradient Boosting", 10, 12) %>%
+  group_rows("Logistic Regression", 13, 15) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed"),
+    font_size = 8,  # Adjust font size
+    position = "center"
+  )
+
+```
+
+- **Decision Tree**: High false positives for the **high** class (108,783) indicate over-prediction of this class. Low false negatives for the **low** class show that most **low** instances are correctly identified.
+- **Random Forest**: Lowest false positives and false negatives across all models for the **high** class. Demonstrates a balanced performance, excelling in correctly identifying all three classes.
+- **SVM**: High false negatives for **medium** (83,650) indicate poor recall for this class. Strong performance for the **low** class but inconsistent for the others.
+- **Gradient Boosting**: Achieves low false negatives for **high** (0) and **low** (211), reflecting strong recall. High false positives for **medium** (516,678), highlighting challenges in distinguishing this class.
+- **Logistic Regression**: Performs adequately for **low** and **high**, with low false negatives. Struggles with **medium**, resulting in high false positives (478,928) and false negatives (68,857).
+
+\vspace{8pt}
+
+The **Random Forest** model demonstrates the most balanced performance across all classes, with minimal misclassifications and strong metrics for true positives and true negatives.The **medium** class consistently shows the highest misclassification rates across all models, indicating that it shares overlapping features with **low** and **high**. Both **Random Forest** and **Gradient Boosting** outperform simpler models (e.g., **Decision Tree**, **Logistic Regression**) due to their ability to capture complex patterns and interactions. The combination of heatmaps and metrics tables provides a comprehensive understanding of model strengths and weaknesses, helping identify areas for improvement.
+
+### Precision, Recall, and F1-Scores
+
+Figure 2 shows the **Precision**, **Recall**, and **F1-Score** for each class across the chosen models. These metrics provide insight into how well each model performs in predicting the different classes.
+
+\vspace{8pt}
+
+Metrics Definitions:
+
+- **Precision**: The proportion of correctly predicted instances of a class out of all instances predicted as that class. High **precision** indicates fewer false positives.
+- **Recall**: The proportion of correctly predicted instances of a class out of all actual instances of that class. High **recall** indicates fewer false negatives.
+- **F1-Score**: The harmonic mean of **precision** and **recall**, balancing the two metrics.
+
+\vspace{10pt}
+
+```{r precision-recall-f1-graphs, echo=FALSE}
+# Function to calculate precision, recall, and F1-score for a model
+calculate_metrics_table <- function(conf_matrix, model_name) {
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)     # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall)  # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Handle NaN values
+  precision[is.na(precision)] <- 0
+  recall[is.na(recall)] <- 0
+  f1[is.na(f1)] <- 0
+  
+  # Create data frame
+  data.frame(
+    Model = model_name,
+    Class = rownames(conf_matrix),
+    Metric = rep(c("Precision", "Recall", "F1"), each = length(rownames(conf_matrix))),
+    Score = c(precision, recall, f1)
+  )
+}
+
+# Calculate metrics for all models
+precision_recall_data <- bind_rows(
+  calculate_metrics_table(as.matrix(dt_conf_matrix), "Decision Tree"),
+  calculate_metrics_table(as.matrix(rf_conf_matrix), "Random Forest"),
+  calculate_metrics_table(as.matrix(svm_conf_matrix), "SVM"),
+  calculate_metrics_table(as.matrix(xgb_conf_matrix), "Gradient Boosting"),
+  calculate_metrics_table(as.matrix(logistic_conf_matrix), "Logistic Regression")
+)
+
+library(ggplot2)
+
+# Create the precision-recall plot
+precision_recall_plot <- ggplot(precision_recall_data, aes(x = Class, y = Score, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Model) +
+  labs(
+    title = "Precision, Recall, and F1-Score Metrics by Model and Class",
+    x = "Class",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",   # Legend on the right
+  )
+
+# Print the plot
+precision_recall_plot
+
+```
+
+\captionof{figure}{Precision, Recall, and F1-Score Metrics by Model and Class}
+
+\vspace{10pt}
+
+- **Decision Tree**: High **recall** for the **high** class indicates most **high**-risk levels are correctly identified. Low **recall** for the **medium** class highlights challenges in detecting **medium**-risk cases accurately, leading to a low **F1-score** for this class.
+- **Random Forest**: Consistent high **precision** and **recall** across all classes. This is reflected in perfect **F1-scores** (1.00) for the **low** and **high** classes and a slightly reduced score for **medium**.
+- **SVM**: High **precision** for **medium** and **high** classes, but low **recall** for **medium**, indicating it struggles to capture all **medium** cases. Balanced performance for the **low** class, with reasonable **F1-score**.
+- **Gradient Boosting**: Strong performance for the **low** and **high** classes, with near-perfect **precision**, **recall**, and **F1-scores**. Moderate recall for the **medium** class, which reduces its **F1-score**.
+- **Logistic Regression**: Good performance for **low** and **high** classes, with balanced metrics. Significant drop in **recall** for **medium**, leading to a low **F1-score** for this class.
+
+\vspace{8pt}
+
+Table 3 presents a numerical summary of the metrics for each model and class. It complements the graph by providing exact values, making it easier to compare models quantitatively.
+
+```{r precision-recall-F1score-alt, echo=FALSE}
+library(knitr)
+library(kableExtra)
+
+# Define confusion matrices for all models
+conf_matrices <- list(
+  "Decision Tree" = dt_conf_matrix,
+  "Random Forest" = rf_conf_matrix,
+  "SVM" = svm_conf_matrix,
+  "Gradient Boosting" = xgb_conf_matrix,
+  "Logistic Regression" = logistic_conf_matrix
+)
+
+# Function to calculate precision, recall, and F1-score
+calculate_metrics_table <- function(conf_matrix, model_name) {
+  # Calculate precision, recall, and F1-score
+  precision <- diag(conf_matrix) / colSums(conf_matrix)  # TP / (TP + FP)
+  recall <- diag(conf_matrix) / rowSums(conf_matrix)     # TP / (TP + FN)
+  f1 <- 2 * (precision * recall) / (precision + recall)  # F1 = 2 * (Precision * Recall) / (Precision + Recall)
+  
+  # Handle NaN values (caused by division by zero)
+  precision[is.na(precision)] <- 0
+  recall[is.na(recall)] <- 0
+  f1[is.na(f1)] <- 0
+  
+  metrics_df <- data.frame(
+    Model = model_name,
+    Class = rownames(conf_matrix),
+    Precision = round(precision, 2),
+    Recall = round(recall, 2),
+    F1_Score = round(f1, 2)
+  )
+  return(metrics_df)
+}
+
+# Collect metrics for each model
+metrics_list <- list()
+for (model_name in names(conf_matrices)) {
+  conf_matrix <- conf_matrices[[model_name]]
+  metrics_df <- calculate_metrics_table(conf_matrix, model_name)
+  metrics_list[[model_name]] <- metrics_df
+}
+
+# Combine metrics into a single table
+all_metrics <- do.call(rbind, metrics_list)
+
+# Create the grouped table
+# Display the metrics table without the first column
+all_metrics %>%
+  select(Model, Class, Precision, Recall, F1_Score) %>%  # Select only relevant columns
+  kable(
+    caption = "Precision, Recall, and F1-Score for Each Model",
+    col.names = c("Model", "Class", "Precision", "Recall", "F1 Score"),
+    row.names = FALSE  # Do not include row names
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover")) %>%
+  group_rows("Decision Tree", 1, 3) %>%
+  group_rows("Random Forest", 4, 6) %>%
+  group_rows("SVM", 7, 9) %>%
+  group_rows("Gradient Boosting", 10, 12) %>%
+  group_rows("Logistic Regression", 13, 15)
+```
+
+- **Decision Tree**: **Precision** performs reasonably for all classes. **Recall** struggles with **medium** class (0.13), leading to a very low **F1-score** (0.22).
+- **Random Forest**: Perfect or near-perfect **precision** and **recall** for all classes, making it the best-performing model overall. Slight drop in **F1-score** for the **medium** class (0.90).
+- **SVM**: Strong **precision** across classes, but **recall** issues with **medium** (0.17) result in a low **F1-score** (0.29).
+- **Gradient Boosting**: Near-perfect metrics for **low** and **high** classes. Reduced performance for **medium** class due to **recall** challenges, reflected in the **F1-score** (0.54).
+- **Logistic Regression**: Balanced **precision** and **recall** for **low** and **high**. Struggles significantly with **medium** class (**recall**: 0.19, **F1-score*:** 0.32).
+
+\vspace{8pt}
+
+The **Random Forest** model emerges as the most robust model, with consistently high metrics across all classes. It effectively captures class boundaries and performs well even for challenging classes like **medium**. The **medium** class consistently shows lower metrics across all models, suggesting that this class has overlapping features with **low** and **high**, making it harder to distinguish.
+
+### ROC Curves 
+
+The **Receiver Operating Characteristic (ROC)** curves measure the performance of classification models by comparing sensitivity (True Positive Rate) and 1-specificity (False Positive Rate). Each curve, in Figure 3, represents the performance of a specific model for predicting whether an instance belongs to a particular class (**high**, **medium**, or **low**) in a One-vs-All classification setup.
+
+\vspace{10pt}
+
+```{r roc-curves, echo=FALSE, warning=FALSE, message=FALSE}
+classes <- c("low", "medium", "high")
+
+# Decision Tree
+roc_curves_dt <- generate_roc_curves(predictions_dt, testing_data$risk_level, "Decision Tree", classes)
+
+# Random Forest
+roc_curves_rf <- generate_roc_curves(predictions_rf, testing_data$risk_level, "Random Forest", classes)
+
+# SVM
+roc_curves_svm <- generate_roc_curves(predictions_svm, testing_data$risk_level, "SVM", classes)
+
+# Gradient Boosting (requires probabilities)
+xgb_class_prob <- predict(xgb_model, x_test) # Predict probabilities
+xgb_class_prob_matrix <- matrix(xgb_class_prob, ncol = length(unique(y_train)), byrow = TRUE) # Reshape into a matrix (rows = instances, columns = classes)
+colnames(xgb_class_prob_matrix) <- levels(balanced_training_data$risk_level) # Assign column names based on class levels
+roc_curves_xgb <- list(
+  "Gradient Boosting (low)" = roc(as.numeric(testing_data$risk_level == "low"), xgb_class_prob_matrix[, "low"]),
+  "Gradient Boosting (medium)" = roc(as.numeric(testing_data$risk_level == "medium"), xgb_class_prob_matrix[, "medium"]),
+  "Gradient Boosting (high)" = roc(as.numeric(testing_data$risk_level == "high"), xgb_class_prob_matrix[, "high"])
+)
+
+# Logistic Regression
+roc_curves_lr <- generate_roc_curves(logistic_predictions, testing_data$risk_level, "Logistic Regression", classes)
+
+# Combine Gradient Boosting ROC curves with others
+all_roc_curves <- c(roc_curves_dt, roc_curves_rf, roc_curves_svm, roc_curves_xgb, roc_curves_lr)
+
+# Combine all ROC curves into a single data frame for ggplot
+all_roc_curves_df <- bind_rows(
+  lapply(names(all_roc_curves), function(name) {
+    data.frame(
+      specificity = 1 - all_roc_curves[[name]]$specificities,
+      sensitivity = all_roc_curves[[name]]$sensitivities,
+      name = name
+    )
+  })
+)
+
+facet_labels <- c(low = "Low", medium = "Medium", high = "High")
+
+# Plot with facets for classes
+ggplot(all_roc_curves_df, aes(x = specificity, y = sensitivity, color = gsub(" \\(.*\\)", "", name), linetype = substr(name, regexpr("\\(", name) + 1, regexpr("\\)", name) - 1))) +
+  geom_line(size = 1) +
+  labs(title = "One-vs-All ROC Curves for All Models", x = "1 - Specificity", y = "Sensitivity", color = "Model", linetype = "Class") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.text = element_text(size = 8),
+    legend.key.width = unit(1, "cm")
+  ) +
+  guides(color = guide_legend(nrow = 2), linetype = guide_legend(nrow = 2)) +
+  facet_wrap(~ substr(name, regexpr("\\(", name) + 1, regexpr("\\)", name) - 1), 
+             scales = "fixed", 
+             labeller = as_labeller(facet_labels))
+```
+
+\captionof{figure}{One-vs-All ROC Curves for All Models}
+
+\vspace{10pt}
+
+- **High Class**: **Gradient Boosting** and **Random Forest** display the highest sensitivity across the full range of specificity. They indicate excellent performance in distinguishing **high** instances. **Decision Tree** and **SVM** show a drop in sensitivity at higher false positive rates. The **Decision Tree** model's curve is linear, which suggests a less nuanced separation of the **high** class.
+- **Medium Class**: **Random Forest** shows the most balanced performance for the **medium** class, with consistently high sensitivity and specificity. **SVM** and **Logistic Regression** lag behind slightly, especially at intermediate false positive rates, indicating challenges in distinguishing the **medium** class. **Gradient Boosting** performs well but dips slightly compared to its performance for the **high** and **low** classes.
+- **Low Class**: All models perform well, with nearly overlapping **ROC** curves close to the top-left corner, indicating high sensitivity and specificity. **Gradient Boosting** and **Random Forest** marginally outperform the other models by maintaining a steeper curve near the origin, indicating minimal false positives.
+
+\vspace{8pt}
+
+**Gradient Boosting** and **Random Forest** demonstrate the best trade-off between sensitivity and specificity for all classes. Their steeper curves and proximity to the top-left corner of the plots confirm their ability to minimize false positives while maintaining high true positive rates. All models, including the top performers, show relatively lower sensitivity for the **medium** class. This indicates that the **medium** class shares overlapping features with the **low** and **high** classes, making it harder to distinguish. 
+
+### Misclassification Analysis
+
+The misclassification analysis, Figure 4, provides insights into the prediction errors for each model across the three risk levels. It quantifies the frequency of correct predictions (no misclassification) versus incorrect predictions (yes misclassification) for each combination of model and class. This allows for evaluating which risk levels are most challenging to predict and comparing the relative performance of models in reducing misclassifications.
+
+\vspace{10pt}
+
+```{r misclassification-analysis, echo=FALSE}
+# Decision Tree
+misclassified_dt <- compute_misclassification(predictions_dt, testing_data$risk_level, "Decision Tree")
+
+# Random Forest
+misclassified_rf <- compute_misclassification(predictions_rf, testing_data$risk_level, "Random Forest")
+
+# SVM
+misclassified_svm <- compute_misclassification(predictions_svm, testing_data$risk_level, "SVM")
+
+# Gradient Boosting
+xgb_probabilities <- matrix(xgb_predictions, ncol = length(levels(testing_data$risk_level)), byrow = TRUE)
+xgb_class_predictions <- apply(xgb_probabilities, 1, function(row) {
+  levels(testing_data$risk_level)[which.max(row)]
+})
+misclassified_xgb <- compute_misclassification(
+  factor(xgb_class_predictions, levels = levels(testing_data$risk_level)),
+  testing_data$risk_level,
+  "Gradient Boosting"
+)
+
+# Logistic Regression
+misclassified_logistic <- compute_misclassification(logistic_predictions, testing_data$risk_level, "Logistic Regression")
+
+# Combine misclassification data
+misclassified_combined <- bind_rows(
+  misclassified_dt,
+  misclassified_rf,
+  misclassified_svm,
+  misclassified_xgb,
+  misclassified_logistic
+)
+
+# Visualize misclassifications
+ggplot(misclassified_combined, aes(x = risk_level, fill = Misclassified)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Model) +
+  labs(title = "Misclassification Analysis by Model and Risk Level",
+       x = "Risk Level",
+       y = "Count") +
+  theme_minimal()
+```
+
+\captionof{figure}{Misclassification Analysis by Model and Risk Level}
+
+\vspace{10pt}
+
+- **Decision Tree**: High misclassification count for the **medium** class, indicating poor predictive ability for this risk level. Moderate misclassification for the **low** class, but **high** class predictions are relatively accurate. Struggles to handle the **medium** class, likely due to simplistic decision boundaries inherent to decision trees.
+- **Random Forest**: Strong performance across all classes, particularly for the **high** class, with minimal misclassification. The **low** class is also well-classified, but there are moderate misclassification counts for the **medium class**. As an ensemble model, **Random Forest** captures complex interactions between features, reducing errors.
+- **SVM**: Moderate misclassification counts for the **medium** and **high** classes. Performs well for the **low** class. 
+- **Gradient Boosting**: High accuracy for the **low** class, with almost negligible misclassification. Some challenges with the **medium** class. The **Gradient Boosting** model's iterative approach improves its ability to capture nuances in the data, reducing errors for most classes.
+- **Logistic Regression**: Performs relatively well for the **low** and **high** classes, but struggles significantly with the **medium** class. High misclassification for the **medium** class may stem from its linear decision boundaries, which are less suited for complex data patterns.
+
+\vspace{8pt}
+
+The **Random Forest** and **Gradient Boosting** demonstrate superior performance, with low misclassification rates across all classes. They are particularly effective for the **low** and **high** risk levels. All models struggle with the **medium** class, likely due to overlapping feature distributions. 
+
+### Feature Importance
+
+Feature importance analysis is crucial to identify which features contribute the most to the predictive performance of each model, understand how different algorithms interpret the dataset, and provide actionable insights for decision-making and further data engineering. This analysis, seen in Figure 5, compares feature importance across four models: **Decision Tree**, **Random Forest**, **SVM**, and **Gradient Boosting**. The importance scores are standardized for consistency and plotted for comparison.
+
+\vspace{8pt}
+
+**Note**: **Logistic Regression** was excluded from the combined Feature Importance visualization because it primarily relies on the intercept and provides non-informative coefficients for features in this context. Including it alongside other models with meaningful feature importance metrics would distort the comparative analysis, leading to misleading interpretations.
+
+\vspace{10pt}
+
+```{r feature-importance, echo=FALSE}
+
+# Extract feature importance from Decision Tree
+dt_importance <- as.data.frame(dt_model$variable.importance)
+dt_importance$Feature <- rownames(dt_importance)
+colnames(dt_importance) <- c("Importance", "Feature")
+dt_importance <- dt_importance %>%
+  mutate(Model = "Decision Tree")
+
+# Extract feature importance from Random Forest
+rf_importance <- as.data.frame(importance(rf_model))
+rf_importance$Feature <- rownames(rf_importance)
+rf_importance <- rf_importance %>%
+  rename(Importance = MeanDecreaseGini) %>%
+  mutate(Model = "Random Forest")
+
+# Extract coefficients from Linear SVM
+svm_coefficients <- t(svm_model$coefs) %*% svm_model$SV
+svm_coefficients_df <- as.data.frame(as.numeric(svm_coefficients))
+svm_coefficients_df$Feature <- colnames(balanced_training_data)[-ncol(balanced_training_data)]
+colnames(svm_coefficients_df) <- c("Coefficient", "Feature")
+svm_coefficients_df <- svm_coefficients_df %>%
+  mutate(Importance = abs(Coefficient)) %>%
+  mutate(Model = "SVM")
+
+# Extract feature importance from Gradient Boosting
+xgb_importance <- xgb.importance(model = xgb_model, feature_names = colnames(x_train))
+xgb_importance_df <- as.data.frame(xgb_importance)
+xgb_importance_df <- xgb_importance_df %>%
+  rename(Importance = Gain) %>%
+  mutate(Model = "Gradient Boosting")
+
+# Combine all feature importances excluding Logistic Regression
+all_importance <- bind_rows(
+  dt_importance,
+  rf_importance,
+  svm_coefficients_df %>% select(Feature, Importance, Model),
+  xgb_importance_df %>% select(Feature, Importance, Model)
+)
+
+# Replace underscores with spaces in Feature names for better readability
+all_importance$Feature <- gsub("_", " ", all_importance$Feature)
+
+# Standardize Importance scores within each Model (Min-Max Scaling)
+all_importance <- all_importance %>%
+  group_by(Model) %>%
+  mutate(Importance_Standardized = (Importance - min(Importance)) / (max(Importance) - min(Importance))) %>%
+  ungroup()
+
+# Select top 10 features per model based on standardized importance
+top_features <- all_importance %>%
+  group_by(Model) %>%
+  top_n(10, Importance_Standardized) %>%
+  ungroup()
+
+# Wrap long feature names for better visualization
+top_features$Feature <- str_wrap(top_features$Feature, width = 20)
+
+# Create the comparative feature importance plot with standardized scores
+ggplot(top_features, aes(x = Importance_Standardized, y = reorder(Feature, Importance_Standardized), fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Feature Importance Across Models",
+       x = "Standardized Importance",
+       y = "Features") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.text.y = element_text(size = 8)
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  scale_fill_brewer(palette = "Set1")
+
+```
+
+\captionof{figure}{Feature Importance Across Models}
+
+\vspace{10pt}
+
+- **week**: This feature is consistently rated as highly important across all models. The feature **week** captures temporal trends or seasonality that strongly influence the classification task. **Gradient Boosting** and **Random Forest** show the highest reliance on this feature, reflecting their strength in handling temporal patterns.
+- **PC2 and PC1**: These features rank high for **SVM** and **Gradient Boosting**. **Principal components** represent linear combinations of original features and help reduce dimensionality. Their importance indicates that aggregated patterns captured by PCA strongly influence predictions.
+- **retail and recreation percent change from baseline**: Important for **Gradient Boosting** and **SVM**. Changes in **retail and recreation activities** may correlate with specific risk levels in the classification task, making this feature valuable.
+- **grocery and pharmacy percent change from baseline**: Important for **Random Forest** and **SVM**. Behavioral changes captured by this feature may reflect risk level distinctions.
+- **workplaces percent change from baseline**: Found to have very low or negligible importance across models, suggesting limited contribution to classification.
+
+\vspace{8pt}
+
+Features like **week** and **principal components (PC1 and PC2)** consistently rank high, suggesting they capture the most predictive signal across the dataset.
+Behavioral features (e.g., **grocery and pharmacy**, **retail and recreation**) are also critical for certain models. **Decision Tree** and **Random Forest** place greater emphasis on raw features like **week**. **SVM** and **Gradient Boosting** effectively leverage transformed features (e.g., principal components), indicating their flexibility in high-dimensional spaces. Features like **workplaces percent change from baseline** have low importance across models, suggesting they do not significantly contribute to risk-level predictions.
+
+# Evaluation
+
+Table 4 provides a quantitative comparison of the five models based on key metrics: **Accuracy**, **Precision**, **Recall**, and **F1-Score**. These metrics highlight the strengths and weaknesses of each model and help identify the most suitable model for deployment in real-world scenarios.
+
+```{r final-evaluation, echo=FALSE, fig.align='left'}
+model_performance <- data.frame(
+  Model = c("Decision Tree", "Random Forest", "SVM", "Gradient Boosting", "Logistic Regression"),
+  Accuracy = c(
+    sum(diag(dt_conf_matrix)) / sum(dt_conf_matrix),
+    sum(diag(rf_conf_matrix)) / sum(rf_conf_matrix),
+    sum(diag(svm_conf_matrix)) / sum(svm_conf_matrix),
+    sum(diag(xgb_conf_matrix)) / sum(xgb_conf_matrix),
+    sum(diag(logistic_conf_matrix)) / sum(logistic_conf_matrix)
+  ),
+  Precision = c(
+    mean(diag(dt_conf_matrix) / colSums(dt_conf_matrix)),
+    mean(diag(rf_conf_matrix) / colSums(rf_conf_matrix)),
+    mean(diag(svm_conf_matrix) / colSums(svm_conf_matrix)),
+    mean(diag(xgb_conf_matrix) / colSums(xgb_conf_matrix)),
+    mean(diag(logistic_conf_matrix) / colSums(logistic_conf_matrix))
+  ),
+  Recall = c(
+    mean(diag(dt_conf_matrix) / rowSums(dt_conf_matrix)),
+    mean(diag(rf_conf_matrix) / rowSums(rf_conf_matrix)),
+    mean(diag(svm_conf_matrix) / rowSums(svm_conf_matrix)),
+    mean(diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix)),
+    mean(diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix))
+  ),
+  F1_Score = c(
+    mean(2 * (diag(dt_conf_matrix) / colSums(dt_conf_matrix)) * (diag(dt_conf_matrix) / rowSums(dt_conf_matrix)) / 
+          (diag(dt_conf_matrix) / colSums(dt_conf_matrix) + diag(dt_conf_matrix) / rowSums(dt_conf_matrix))),
+    mean(2 * (diag(rf_conf_matrix) / colSums(rf_conf_matrix)) * (diag(rf_conf_matrix) / rowSums(rf_conf_matrix)) / 
+          (diag(rf_conf_matrix) / colSums(rf_conf_matrix) + diag(rf_conf_matrix) / rowSums(rf_conf_matrix))),
+    mean(2 * (diag(svm_conf_matrix) / colSums(svm_conf_matrix)) * (diag(svm_conf_matrix) / rowSums(svm_conf_matrix)) / 
+          (diag(svm_conf_matrix) / colSums(svm_conf_matrix) + diag(svm_conf_matrix) / rowSums(svm_conf_matrix))),
+    mean(2 * (diag(xgb_conf_matrix) / colSums(xgb_conf_matrix)) * (diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix)) / 
+          (diag(xgb_conf_matrix) / colSums(xgb_conf_matrix) + diag(xgb_conf_matrix) / rowSums(xgb_conf_matrix))),
+    mean(2 * (diag(logistic_conf_matrix) / colSums(logistic_conf_matrix)) * (diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix)) / 
+          (diag(logistic_conf_matrix) / colSums(logistic_conf_matrix) + diag(logistic_conf_matrix) / rowSums(logistic_conf_matrix)))
+  )
+)
+
+# Display the summary table
+library(kableExtra)
+
+model_performance %>%
+  kable(
+    caption = "Comparative Model Performance Metrics",
+    digits = 2,
+    col.names = c("Model", "Accuracy", "Precision", "Recall", "F1-Score")
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+The primary goal of the classification model is to predict COVID-19 risk levels for counties (**low**, **medium**, **high**) and provide actionable insights for early interventions. The evaluation demonstrates the following:
+
+\vspace{8pt}
+
+**Random Forest**
+
+- **Utility**: This model achieves near-perfect **accuracy** (0.99) and perfect **precision** (1.00), ensuring minimal false positives. Its high **recall** (0.94) also indicates the ability to capture most **high**-risk cases. This balance is crucial for stakeholders aiming to allocate resources efficiently without missing critical areas requiring intervention.
+- **Real-Life Impact**: With its strong performance, this model is ideal for guiding decisions like prioritizing vaccination campaigns, allocating medical supplies, and implementing lockdowns in **high**-risk areas. Its low misclassification rate across all classes ensures reliable predictions that build trust among stakeholders.
+
+**Gradient Boosting**
+
+- **Utility**: **Gradient Boosting** achieves excellent performance across all metrics, particularly in **accuracy** (0.94) and **F1-score** (0.83). However, its **recall** (0.79) slightly lags behind **Random Forest**, meaning it could miss some **high**-risk areas.
+- **Real-Life Impact**: This model is a strong alternative, particularly in scenarios where interpretability or computational efficiency is a priority. Stakeholders can use it to refine decisions in **medium-**risk areas, where it provides slightly better precision than **Random Forest**.
+
+**Logistic Regression**
+
+- **Utility**: **Logistic Regression** provides moderate performance, with an **accuracy** of 0.87 and balanced **precision** and **recall** (0.88 and 0.73). While it is less effective at distinguishing **medium**-risk areas, it serves as a reliable baseline for comparison.
+- **Real-Life Impact**: This model is suitable for stakeholders needing a simpler, computationally efficient option. However, it may require manual adjustment or supplementary models for improved performance in **medium**-risk predictions.
+
+**SVM**
+
+- **Utility**: **SVM** performs well for **low** and **high**-risk categories, but its recall for the **medium**-risk class is limited (0.72), leading to a lower **F1-score** (0.70).
+- **Real-Life Impact**: Due to its computational intensity and moderate performance, **SVM** may not be ideal for large-scale deployment. However, it can still provide value in small datasets or as a supplementary model for **high**-precision tasks.
+
+**Decision Tree**
+
+- **Utility**: The **Decision Tree** model is the most interpretable, with an **accuracy** of 0.79 and a relatively low **F1-score** of 0.67. It struggles with capturing **medium**-risk cases due to its simplicity.
+- **Real-Life Impact**: Its transparency makes it suitable for stakeholders who prioritize interpretability over performance, such as policy advisors needing clear decision-making rules. However, it is less effective in high-stakes scenarios requiring high **recall**.
+
+\vspace{8pt}
+
+**Medium**-risk misclassification is a recurring issue. Stakeholders should interpret **medium**-risk predictions with caution and supplement the model with domain expertise. 
+
+\vspace{8pt}
+
+The **Random Forest** model is the most robust option for deployment, offering excellent **accuracy** and **precision** while minimizing false negatives. This ensures stakeholders can trust its predictions to make impactful, data-driven decisions. For example, it can prioritize counties for vaccination campaigns or testing efforts, minimizing wasted resources. **Gradient Boosting** serves as a strong backup, particularly in scenarios requiring better performance for **low** and **medium**-risk predictions. Models like **Logistic Regression** and **Decision Tree** provide value as interpretable baselines but are outperformed by ensemble methods for this task. By leveraging the insights provided, stakeholders can allocate resources effectively, implement timely interventions, and mitigate the societal and economic impacts of future pandemics.
+
+# Deployment
+
+The models can predict **high**-risk counties early, enabling stakeholders to deploy healthcare resources effectively, implement containment measures such as testing and quarantine, and mobilize vaccination efforts to high-priority areas. The high **precision** of models like **Random Forest** ensures resources are not wasted on false alarms, particularly when distributing medical supplies or setting up treatment facilities. **Low**-risk predictions can guide policymakers in lifting restrictions to support economic recovery. **Medium**-risk predictions, while challenging for all models, can help refine decisions where uncertainty exists.
+
+\vspace{8pt}
+
+The model should be updated weekly to reflect new COVID-19 data, ensuring its predictions remain relevant. Weekly updates allow it to capture dynamic changes in case counts and population behavior, critical for accurate risk categorization.
+
+```{r deployment, echo=FALSE, results = 'hide', message=FALSE}
+# Save all models
+# save_model(dt_model, "dt_model_balanced.rds")
+# save_model(rf_model, "rf_model_balanced.rds")
+# save_model(svm_model, "svm_model_balanced.rds")
+# save_model(xgb_model, "xgb_model_balanced.rds")
+# save_model(logistic_model, "logistic_model_balanced.rds")
+
+# Load all models
+# loaded_dt_model <- load_model("dt_model_balanced.rds")
+# loaded_rf_model <- load_model("rf_model_balanced.rds")
+# loaded_svm_model <- load_model("svm_model_balanced.rds")
+# loaded_xgb_model <- load_model("xgb_model_balanced.rds")
+# loaded_logistic_model <- load_model("logistic_model_balanced.rds")
+```
+
+# Appendix
+
+## Team Contributions
+
+Olivia Hofmann and Michael Perkins split the work equally, using an iterative method.
+
+- Olivia Hofmann: Lead on data preparation and feature engineering.
+- Michael Perkins: Lead on modeling and evaluation.
+
+## Graduate Work
+
+- **Additional Models**: Gradient Boosting and Logistic Regression.
